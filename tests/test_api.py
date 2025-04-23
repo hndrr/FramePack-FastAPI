@@ -583,3 +583,28 @@ def test_list_loras_exception(mocker):
     assert response.status_code == 200
     response_json = response.json()
     assert response_json["loras"] == []
+
+
+# --- Test for /queue endpoint ---
+
+def test_get_queue_info(mocker):
+    """Test the /queue endpoint successfully returns queue status."""
+    # Define dummy queue data that get_queue_status might return
+    mock_queue_data = [
+        {"job_id": "job1", "status": "pending", "prompt": "prompt1...", "video_length": 5.0, "progress": 0.0, "progress_info": ""},
+        {"job_id": "job2", "status": "processing", "prompt": "prompt2...", "video_length": 2.0, "progress": 50.0, "progress_info": "Sampling..."},
+        {"job_id": "job3", "status": "completed", "prompt": "prompt3...", "video_length": 1.0, "progress": 100.0, "progress_info": "Completed"},
+    ]
+    # Mock the function called by the endpoint
+    mocker.patch("api.queue_manager.get_queue_status", return_value=mock_queue_data)
+
+    # Call the endpoint
+    response = client.get("/queue")
+
+    # Assertions
+    assert response.status_code == 200
+    response_json = response.json()
+    assert response_json["queue"] == mock_queue_data
+
+    # Verify the mock was called
+    queue_manager.get_queue_status.assert_called_once()
