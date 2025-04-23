@@ -7,7 +7,7 @@ import traceback
 from dataclasses import dataclass, asdict
 from typing import Optional
 import uuid
-
+import numpy as np
 # Path to the quick prompts JSON file
 PROMPT_FILE = os.path.join(os.getcwd(), 'quick_prompts.json')
 
@@ -165,7 +165,9 @@ def save_image_to_temp(image: np.ndarray, job_id: str) -> str:
     """Save image to temp directory and return the path"""
     try:
         # Convert numpy array to PIL Image
-        pil_image = Image.fromarray(image)
+        # Remove single-dimensional entries from the shape of an array
+        squeezed_image = np.squeeze(image)
+        pil_image = Image.fromarray(squeezed_image)
         # Create unique filename using hex ID
         filename = f"queue_image_{job_id}.png"
         filepath = os.path.join(temp_queue_images, filename)
@@ -182,7 +184,8 @@ def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_pre
         # Generate a unique hex ID for the job
         job_id = uuid.uuid4().hex[:8]
         # Save image to temp directory and get path
-        image_path = save_image_to_temp(image, job_id)
+        image_array = np.array(image)
+        image_path = save_image_to_temp(image_array, job_id)
         if not image_path:
             return None
             
@@ -369,6 +372,10 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+    # Ensure input_image is a NumPy array
+    if isinstance(input_image, list):
+        input_image = np.array(input_image)
+
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -405,6 +412,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Image processing ...'))))
 
+        # Ensure the image shape is 3D (H, W, C) by squeezing extra dimensions
+        input_image = np.squeeze(input_image)
         H, W, C = input_image.shape
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)

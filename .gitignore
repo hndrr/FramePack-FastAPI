@@ -177,4 +177,9 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .vscode/settings.json
+
+# temporary files
 quick_prompts.json
+job_queue.json
+temp_queue_images/*
+    
