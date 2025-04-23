@@ -12,12 +12,31 @@ import traceback
 # from diffusers import AutoencoderKLHunyuanVideo
 # from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer, SiglipImageProcessor, SiglipVisionModel
 
-from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode  # vae_decode_fake might be needed too
+from diffusers_helper.hunyuan import (
+    encode_prompt_conds,
+    vae_decode,
+    vae_encode,
+    # vae_decode_fake, # Unused in current API worker
+)
 # from diffusers_helper.load_lora import load_lora  # Unused
-from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, resize_and_center_crop, soft_append_bcthw  # Removed generate_timestamp, Added soft_append_bcthw
+from diffusers_helper.utils import (
+    save_bcthw_as_mp4,
+    crop_or_pad_yield_mask,
+    resize_and_center_crop,
+    soft_append_bcthw,
+)  # Removed generate_timestamp, Added soft_append_bcthw
+
 # from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked  # Unused
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, fake_diffusers_current_device, unload_complete_models, load_model_as_complete  # Removed cpu, offload_..., DynamicSwapInstaller
+from diffusers_helper.memory import (
+    gpu,
+    get_cuda_free_memory_gb,
+    move_model_to_device_with_memory_preservation,
+    fake_diffusers_current_device,
+    unload_complete_models,
+    load_model_as_complete,
+)  # Removed cpu, offload_..., DynamicSwapInstaller
+
 # from diffusers_helper.thread_utils import AsyncStream, async_run  # Removed stream
 # from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html  # Unused
 from diffusers_helper.clip_vision import hf_clip_vision_encode
@@ -34,8 +53,8 @@ outputs_folder = settings.OUTPUTS_DIR
 # Determine VRAM mode - consider moving to settings.py or detecting dynamically
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 60  # Threshold might need adjustment
-print(f'Worker: Free VRAM {free_mem_gb} GB')
-print(f'Worker: High-VRAM Mode: {high_vram}')
+print(f"Worker: Free VRAM {free_mem_gb} GB")
+print(f"Worker: High-VRAM Mode: {high_vram}")
 
 
 @torch.no_grad()
@@ -70,14 +89,14 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     queue_manager.update_job_status(job_id, "processing")
 
     # Load models from the dictionary
-    vae = models['vae']
-    text_encoder = models['text_encoder']
-    text_encoder_2 = models['text_encoder_2']
-    image_encoder = models['image_encoder']
-    transformer = models['transformer']
-    tokenizer = models['tokenizer']
-    tokenizer_2 = models['tokenizer_2']
-    feature_extractor = models['feature_extractor']
+    vae = models["vae"]
+    text_encoder = models["text_encoder"]
+    text_encoder_2 = models["text_encoder_2"]
+    image_encoder = models["image_encoder"]
+    transformer = models["transformer"]
+    tokenizer = models["tokenizer"]
+    tokenizer_2 = models["tokenizer_2"]
+    feature_extractor = models["feature_extractor"]
 
     # Placeholder for progress update function (replaces stream.output_queue.push)
     def update_progress(step_info: str, percentage: float = 0.0):
@@ -86,7 +105,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         # queue_manager.update_job_status(job_id, f"processing - {step_info}", ...)
         pass  # Replace with actual progress reporting if needed
 
-    update_progress('Starting ...', 0)
+    update_progress("Starting ...", 0)
 
     try:
         # Load input image
@@ -100,34 +119,84 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         except Exception as e:
             print(f"Error loading image {input_image_path}: {e}")
             queue_manager.update_job_status(job_id, f"failed - image load error: {e}")
+            return  # Added return here
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
 
         # Clean GPU if not high_vram
         if not high_vram:
-            update_progress('Cleaning GPU memory...', 0)
+            update_progress("Cleaning GPU memory...", 0)
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
 
         # Text encoding
-        update_progress('Text encoding ...', 5)
+        update_progress("Text encoding ...", 5)
         if not high_vram:
             fake_diffusers_current_device(text_encoder, gpu)
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+        llama_vec, clip_l_pooler = encode_prompt_conds(
+            prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+        )
+
+        # Check if encoding returned None
+        if llama_vec is None or clip_l_pooler is None:
+            print(f"Error: Failed to encode positive prompt for job {job_id}")
+            queue_manager.update_job_status(job_id, "failed - prompt encoding error")
+            return
 
         if cfg == 1:
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+            # Ensure llama_vec is valid before creating zeros_like
+            if llama_vec is None or clip_l_pooler is None:
+                print(
+                    f"Error: Cannot create negative embeddings because positive embeddings are None for job {job_id}"
+                )
+                queue_manager.update_job_status(
+                    job_id, "failed - prompt encoding error"
+                )
+                return
+            llama_vec_n, clip_l_pooler_n = torch.zeros_like(
+                llama_vec
+            ), torch.zeros_like(clip_l_pooler)
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(
+                n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+            )
+
+            # Check if encoding returned None for negative prompt
+            if llama_vec_n is None or clip_l_pooler_n is None:
+                print(
+                    f"Warning: Failed to encode negative prompt for job {job_id}. Using zeros."
+                )
+                # Fallback to zeros if negative encoding fails but cfg != 1
+                if (
+                    llama_vec is None or clip_l_pooler is None
+                ):  # Should not happen due to earlier check, but safety first
+                    print(
+                        f"Error: Cannot create negative embeddings because positive embeddings are None for job {job_id}"
+                    )
+                    queue_manager.update_job_status(
+                        job_id, "failed - prompt encoding error"
+                    )
+                    return
+                llama_vec_n, clip_l_pooler_n = torch.zeros_like(
+                    llama_vec
+                ), torch.zeros_like(clip_l_pooler)
+
+        # Ensure embeddings are not None before padding
+        if llama_vec is None or llama_vec_n is None:
+            print(f"Error: Embeddings are None before padding for job {job_id}")
+            queue_manager.update_job_status(job_id, "failed - prompt encoding error")
+            return
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(
+            llama_vec_n, length=512
+        )
 
         # Processing input image
-        update_progress('Image processing ...', 10)
+        update_progress("Image processing ...", 10)
         input_image = np.squeeze(input_image)  # Ensure 3D
         if input_image.ndim != 3 or input_image.shape[2] != 3:
             print(f"Error: Invalid image shape {input_image.shape} for job {job_id}")
@@ -135,32 +204,40 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             return
 
         H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=640)  # Assuming default resolution
-        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+        height, width = find_nearest_bucket(
+            H, W, resolution=640
+        )  # Assuming default resolution
+        input_image_np = resize_and_center_crop(
+            input_image, target_width=width, target_height=height
+        )
 
         # Save a copy of the processed input image (optional, but good for reference)
-        processed_input_image_path = os.path.join(outputs_folder, f'{job_id}_input.png')
+        processed_input_image_path = os.path.join(outputs_folder, f"{job_id}_input.png")
         metadata = PngInfo()
         metadata.add_text("prompt", prompt)
         metadata.add_text("seed", str(seed))
-        Image.fromarray(input_image_np).save(processed_input_image_path, pnginfo=metadata)
+        Image.fromarray(input_image_np).save(
+            processed_input_image_path, pnginfo=metadata
+        )
 
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding
-        update_progress('VAE encoding ...', 15)
+        update_progress("VAE encoding ...", 15)
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
 
         start_latent = vae_encode(input_image_pt, vae)
 
         # CLIP Vision encoding
-        update_progress('CLIP Vision encoding ...', 20)
+        update_progress("CLIP Vision encoding ...", 20)
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
 
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+        image_encoder_output = hf_clip_vision_encode(
+            input_image_np, feature_extractor, image_encoder
+        )
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
         # Dtype conversion
@@ -168,14 +245,20 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         llama_vec_n = llama_vec_n.to(transformer.dtype)
         clip_l_pooler = clip_l_pooler.to(transformer.dtype)
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
-        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
+        image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(
+            transformer.dtype
+        )
 
         # Sampling
-        update_progress('Start sampling ...', 25)
-        rnd = torch.Generator("cpu").manual_seed(seed)
-        # num_frames = latent_window_size * 4 - 3 # Unused variable
+        update_progress("Start sampling ...", 25)
+        # generator オブジェクトを再定義
+        rnd = torch.Generator(device=gpu).manual_seed(seed)  # Use GPU generator if possible
+        # num_frames を再定義
+        num_frames = latent_window_size * 4 - 3
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+        history_latents = torch.zeros(
+            size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32
+        ).cpu()
         history_pixels = None
         total_generated_latent_frames = 0
 
@@ -190,12 +273,16 @@ def worker(job: queue_manager.QueuedJob, models: dict):
 
         for latent_padding in latent_paddings:
             current_sampling_step += 1
-            section_progress_start = 25 + (current_sampling_step - 1) * (70 / sampling_step_count)
-            section_progress_end = 25 + current_sampling_step * (70 / sampling_step_count)
+            section_progress_start = 25 + (current_sampling_step - 1) * (
+                70 / sampling_step_count
+            )
+            section_progress_end = 25 + current_sampling_step * (
+                70 / sampling_step_count
+            )
 
             # Check for cancellation signal (e.g., if job status is set to 'cancelled')
             current_job_status = queue_manager.get_job_by_id(job_id)
-            if current_job_status and current_job_status.status == 'cancelled':
+            if current_job_status and current_job_status.status == "cancelled":
                 print(f"Job {job_id} cancelled during sampling.")
                 # No need to update status again, it's already 'cancelled'
                 return
@@ -203,20 +290,44 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
 
-            print(f'Job {job_id}: latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}')
-            update_progress(f'Sampling section {current_sampling_step}/{sampling_step_count}', section_progress_start)
+            print(
+                f"Job {job_id}: latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}"
+            )
+            update_progress(
+                f"Sampling section {current_sampling_step}/{sampling_step_count}",
+                section_progress_start,
+            )
 
-            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
-            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+            indices = torch.arange(
+                0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])
+            ).unsqueeze(0)
+            (
+                clean_latent_indices_pre,
+                blank_indices,
+                latent_indices,
+                clean_latent_indices_post,
+                clean_latent_2x_indices,
+                clean_latent_4x_indices,
+            ) = indices.split(
+                [1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1
+            )
+            clean_latent_indices = torch.cat(
+                [clean_latent_indices_pre, clean_latent_indices_post], dim=1
+            )
 
             clean_latents_pre = start_latent.to(history_latents)
-            clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+            clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[
+                :, :, : 1 + 2 + 16, :, :
+            ].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             if not high_vram:
                 unload_complete_models()
-                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+                move_model_to_device_with_memory_preservation(
+                    transformer,
+                    target_device=gpu,
+                    preserved_memory_gb=gpu_memory_preservation,
+                )
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
@@ -225,16 +336,29 @@ def worker(job: queue_manager.QueuedJob, models: dict):
 
             # K-Diffusion Sampling Callback
             def callback(d):
-                step = d['i']
-                total = d['total']
-                current_progress = section_progress_start + (step / total) * (section_progress_end - section_progress_start) * 0.9  # Allocate 90% of section time to sampling
-                update_progress(f'Sampling section {current_sampling_step}/{sampling_step_count} - Step {step+1}/{total}', current_progress)
+                step = d["i"]
+                total = d["total"]
+                current_progress = (
+                    section_progress_start
+                    + (step / total)
+                    * (section_progress_end - section_progress_start)
+                    * 0.9
+                )  # Allocate 90% of section time to sampling
+                update_progress(
+                    f"Sampling section {current_sampling_step}/{sampling_step_count} - Step {step+1}/{total}",
+                    current_progress,
+                )
 
                 # Check for cancellation signal within callback
                 current_job_status_inner = queue_manager.get_job_by_id(job_id)
-                if current_job_status_inner and current_job_status_inner.status == 'cancelled':
+                if (
+                    current_job_status_inner
+                    and current_job_status_inner.status == "cancelled"
+                ):
                     print(f"Job {job_id} cancelled during sampling step {step+1}.")
-                    raise InterruptedError("Job cancelled")  # Raise exception to stop sampling
+                    raise InterruptedError(
+                        "Job cancelled"
+                    )  # Raise exception to stop sampling
 
                 # Original callback logic (if any) can go here
                 # Example: preview generation (might be complex for API)
@@ -244,54 +368,86 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                 #     # Send preview update (how depends on API design)
 
             try:
+                # --- 引数チェックは一旦コメントアウト ---
+                # args_to_check = { ... }
+                # none_args = [name for name, val in args_to_check.items() if val is None]
+                # if none_args:
+                #     error_msg = f"Error: The following arguments are None before calling sample_hunyuan: {', '.join(none_args)} for job {job_id}"
+                #     print(error_msg)
+                #     queue_manager.update_job_status(job_id, "failed - internal error (None arg)")
+                #     return # Stop processing this section
+                # --- End comprehensive check ---
+
+                # --- sample_hunyuan 呼び出し方を demo_gradio.py に合わせる ---
                 generated_latents = sample_hunyuan(
-                    model=transformer,
-                    seed=rnd.randint(0, 1 << 30),
-                    steps=steps,
-                    cfg=cfg,
-                    gs=gs,
-                    rs=rs,
-                    sampler_name='dpmpp_2m_sde',  # Or make configurable
-                    scheduler_name='karras',     # Or make configurable
-                    latent_image=start_latent,
-                    positive_llama=llama_vec,
-                    negative_llama=llama_vec_n,
-                    positive_clip_l_pooler=clip_l_pooler,
-                    negative_clip_l_pooler=clip_l_pooler_n,
-                    positive_image_encoder_hidden_states=image_encoder_last_hidden_state,
-                    negative_image_encoder_hidden_states=torch.zeros_like(image_encoder_last_hidden_state),
-                    llama_attention_mask=llama_attention_mask,
-                    llama_attention_mask_negative=llama_attention_mask_n,
-                    latent_padding_size=latent_padding_size,
-                    latent_window_size=latent_window_size,
-                    clean_latents=clean_latents,
-                    clean_latent_indices=clean_latent_indices,
-                    clean_latents_2x=clean_latents_2x,
-                    clean_latent_2x_indices=clean_latent_2x_indices,
-                    clean_latents_4x=clean_latents_4x,
-                    clean_latent_4x_indices=clean_latent_4x_indices,
-                    callback=callback,
-                    disable_pbar=True  # Disable internal progress bar
+                    transformer=transformer,  # キーワード引数で渡す
+                    sampler='unipc',  # demo_gradio.py から追加
+                    width=width,  # demo_gradio.py から追加
+                    height=height,  # demo_gradio.py から追加
+                    frames=num_frames,  # demo_gradio.py から追加 (再定義した変数を使用)
+                    real_guidance_scale=cfg,  # demo_gradio.py から追加 (cfg を使用)
+                    distilled_guidance_scale=gs,  # 引数名を修正 (gs を使用)
+                    guidance_rescale=rs,  # 引数名を修正 (rs を使用)
+                    num_inference_steps=steps,  # 引数名を修正 (steps を使用)
+                    generator=rnd,  # demo_gradio.py から追加 (再定義した変数を使用)
+                    prompt_embeds=llama_vec,  # 引数名を修正
+                    prompt_embeds_mask=llama_attention_mask,  # 引数名を修正
+                    prompt_poolers=clip_l_pooler,  # 引数名を修正
+                    negative_prompt_embeds=llama_vec_n,  # 引数名を修正
+                    negative_prompt_embeds_mask=llama_attention_mask_n,  # 引数名を修正
+                    negative_prompt_poolers=clip_l_pooler_n,  # 引数名を修正
+                    device=gpu,  # demo_gradio.py から追加
+                    dtype=transformer.dtype,  # demo_gradio.py から追加 (transformer の dtype を使用)
+                    image_embeddings=image_encoder_last_hidden_state,  # 引数名を修正
+                    latent_indices=latent_indices,  # demo_gradio.py から追加 (ループ内で計算される)
+                    clean_latents=clean_latents,  # キーワード引数
+                    clean_latent_indices=clean_latent_indices,  # キーワード引数
+                    clean_latents_2x=clean_latents_2x,  # キーワード引数
+                    clean_latent_2x_indices=clean_latent_2x_indices,  # キーワード引数
+                    clean_latents_4x=clean_latents_4x,  # キーワード引数
+                    clean_latent_4x_indices=clean_latent_4x_indices,  # キーワード引数
+                    callback=callback,  # キーワード引数
+                    # --- 不要な引数を削除 ---
+                    # seed=seed + current_sampling_step,
+                    # sampler_name='dpmpp_2m_sde',
+                    # scheduler_name='karras',
+                    # latent_image=start_latent,
+                    # positive_image_encoder_hidden_states=image_encoder_last_hidden_state,
+                    # negative_image_encoder_hidden_states=torch.zeros_like(image_encoder_last_hidden_state),
+                    # latent_padding_size=latent_padding_size,
+                    # latent_window_size=latent_window_size,
+                    # disable_pbar=True
                 )
+                # --- 呼び出し修正ここまで ---
             except InterruptedError:
                 # Job was cancelled during sampling via callback
                 return  # Exit worker function
 
             # Update history
-            history_latents = generated_latents[:, :, - (1 + 2 + 16):, :, :].clone()
+            history_latents = generated_latents[:, :, -(1 + 2 + 16):, :, :].clone()  # Corrected slicing
 
             # Decode and append frames
-            update_progress(f'VAE decoding section {current_sampling_step}/{sampling_step_count}', section_progress_end - 1)  # Just before finishing section
+            update_progress(
+                f"VAE decoding section {current_sampling_step}/{sampling_step_count}",
+                section_progress_end - 1,
+            )  # Just before finishing section
             if not high_vram:
                 unload_complete_models()
                 load_model_as_complete(vae, target_device=gpu)
 
-            pixels = vae_decode(generated_latents[:, :, latent_padding_size:latent_padding_size + latent_window_size], vae)
+            pixels = vae_decode(
+                generated_latents[
+                    :, :, latent_padding_size:latent_padding_size + latent_window_size  # Corrected slicing
+                ],
+                vae,
+            )
 
             if history_pixels is None:
                 history_pixels = pixels
             else:
-                history_pixels = soft_append_bcthw(history_pixels, pixels, soft_length=4)
+                history_pixels = soft_append_bcthw(
+                    history_pixels, pixels, soft_length=4
+                )
 
             total_generated_latent_frames += latent_window_size
 
@@ -300,20 +456,20 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             # save_bcthw_as_mp4(history_pixels, intermediate_filename, crf=mp4_crf, frame_rate=30)
 
         # Final save
-        update_progress('Saving final video...', 98)
-        final_filename = os.path.join(outputs_folder, f'{job_id}.mp4')
+        update_progress("Saving final video...", 98)
+        final_filename = os.path.join(outputs_folder, f"{job_id}.mp4")
         save_bcthw_as_mp4(history_pixels, final_filename, crf=mp4_crf, frame_rate=30)
 
         # Update job status to completed
         queue_manager.update_job_status(job_id, "completed")
-        update_progress('Finished', 100)
+        update_progress("Finished", 100)
         print(f"Job {job_id} completed successfully. Output: {final_filename}")
 
     except Exception as e:
         print(f"Error processing job {job_id}: {str(e)}")
         traceback.print_exc()
         queue_manager.update_job_status(job_id, f"failed - {type(e).__name__}")
-        update_progress(f'Failed: {type(e).__name__}', 100)
+        update_progress(f"Failed: {type(e).__name__}", 100)
 
     finally:
         # Final GPU cleanup (optional, depends on worker lifecycle)
@@ -325,7 +481,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
 
 
 # Example usage (for testing purposes, would be called by a background task runner)
-if __name__ == '__main__':
+if __name__ == "__main__":
     print("Worker module loaded. Contains the 'worker' function.")
     # Add test code here if needed, e.g., creating a dummy job and models
     # and calling worker(dummy_job, dummy_models)

@@ -1,4 +1,11 @@
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file located in the project root
+# Assumes settings.py is in 'api' subdirectory
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+dotenv_path = os.path.join(project_root, '.env')
+load_dotenv(dotenv_path=dotenv_path)
 
 # API Server Settings
 API_HOST = "0.0.0.0"  # Listen on all available network interfaces
