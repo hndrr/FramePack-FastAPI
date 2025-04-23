@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
-from typing import List, Optional  # Import Optional
+from typing import List, Optional  # Import Optional (Dict removed as unused)
 
 # Import modules created earlier (relative imports)
 from . import settings
@@ -125,6 +125,10 @@ class WorkerStatusResponse(BaseModel):
     processing_job_id: Optional[str] = None
 
 
+class LoraListResponse(BaseModel):
+    loras: List[str]
+
+
 # --- Background Worker ---
 def background_worker_task():
     global worker_running, currently_processing_job_id
@@ -176,6 +180,8 @@ async def generate_video(
     gs: float = Form(10.0),
     rs: float = Form(0.0),
     mp4_crf: float = Form(16.0),
+    lora_scale: float = Form(1.0),  # 追加: LoRA強度パラメータ
+    lora_path: Optional[str] = Form(None, description="Path to the LoRA file to use for this request (overrides server default if provided)."),  # 追加: LoRAファイルパス
     image: UploadFile = File(...)
 ):
     """
@@ -212,6 +218,8 @@ async def generate_video(
             gs=gs,
             rs=rs,
             mp4_crf=mp4_crf,
+            lora_scale=lora_scale,  # 追加: lora_scale を渡す
+            lora_path=lora_path,    # 追加: lora_path を渡す
             status="pending"  # Explicitly set initial status
         )
     except Exception as e:
@@ -349,6 +357,28 @@ async def cancel_job(job_id: str):
             # If still not found or status isn't completed, raise internal error
             print(f"Failed to update status to cancelled for job {job_id}, job might not exist anymore.")
             raise HTTPException(status_code=500, detail="Failed to request job cancellation. Job might have finished or encountered an issue.")
+
+
+@app.get("/loras", response_model=LoraListResponse)
+async def list_loras():
+    """Lists available LoRA files from the configured directory."""
+    lora_files = []
+    allowed_extensions = {".safetensors", ".pt", ".bin"}  # Common LoRA extensions
+    try:
+        if os.path.isdir(settings.LORA_DIR):
+            for filename in os.listdir(settings.LORA_DIR):
+                if os.path.isfile(os.path.join(settings.LORA_DIR, filename)):
+                    _, ext = os.path.splitext(filename)
+                    if ext.lower() in allowed_extensions:
+                        lora_files.append(filename)
+            lora_files.sort()  # Sort alphabetically
+        else:
+            print(f"Warning: LORA_DIR '{settings.LORA_DIR}' is not a valid directory.")
+    except Exception as e:
+        print(f"Error listing LoRA files: {e}")
+        # Return empty list on error, or raise HTTPException
+        # raise HTTPException(status_code=500, detail=f"Failed to list LoRA files: {e}")
+    return LoraListResponse(loras=lora_files)
 
 
 # --- Main execution (for running with uvicorn) ---

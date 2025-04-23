@@ -1,6 +1,7 @@
 import os
 import torch
 import numpy as np
+from pathlib import Path  # 追加
 from PIL import Image  # Removed ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
 import traceback
@@ -40,6 +41,7 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 from . import queue_manager
 from .queue_manager import update_job_progress  # Import the specific function
 from . import settings  # Import settings to get OUTPUTS_DIR
+from diffusers_helper.load_lora import load_lora  # 追加
 
 # Define output folder using settings
 outputs_folder = settings.OUTPUTS_DIR
@@ -78,6 +80,8 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     use_teacache = job.use_teacache
     mp4_crf = job.mp4_crf
     job_id = job.job_id
+    lora_scale = job.lora_scale  # 追加: lora_scale をジョブから取得
+    lora_path = job.lora_path    # 追加: lora_path をジョブから取得
 
     # Update job status to processing
     queue_manager.update_job_status(job_id, "processing")
@@ -199,8 +203,40 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             llama_vec_n, length=512
         )
 
+        # --- LoRA Loading (moved here, after text encoding, before image processing) ---
+        # --- LoRA Loading ---
+        # Construct full path if lora_path is provided (assumed to be filename from /loras endpoint)
+        full_lora_path = None
+        if lora_path:
+            # Check if lora_path is already an absolute path (optional, for flexibility)
+            if os.path.isabs(lora_path):
+                full_lora_path = lora_path
+            else:
+                # Assume it's a filename and join with LORA_DIR
+                full_lora_path = os.path.join(settings.LORA_DIR, lora_path)
+
+        if full_lora_path and os.path.exists(full_lora_path):
+            print(f"Job {job_id}: Loading LoRA from: {full_lora_path} with scale {lora_scale}")
+            update_progress(f"Loading LoRA '{lora_path}' (scale={lora_scale})...", 11, 0, steps)  # Progress update with filename
+            try:
+                # load_lora expects directory and filename separately
+                lora_dir, lora_name = os.path.split(full_lora_path)
+                # transformer 変数を更新する
+                transformer = load_lora(transformer, Path(lora_dir), lora_name, lora_scale=lora_scale)
+                print(f"Job {job_id}: LoRA loaded successfully.")
+            except Exception as e:
+                print(f"Job {job_id}: Error loading LoRA: {e}")
+                # LoRAロード失敗時の処理 (例: ログ出力して続行、ジョブを失敗させるなど)
+                # queue_manager.update_job_status(job_id, f"failed - LoRA load error: {e}")
+                # return
+        elif lora_path:  # Only print warning if lora_path was provided but file not found
+            print(f"Job {job_id}: Warning - LoRA path '{lora_path}' specified but file not found at '{full_lora_path}'.")
+        else:
+            print(f"Job {job_id}: No LoRA path specified, skipping LoRA loading.")
+        # --- End LoRA Loading ---
+
         # Processing input image
-        update_progress("Image processing ...", 10, 0, steps)
+        update_progress("Image processing ...", 12, 0, steps)  # Progress update (percentage adjusted)
         input_image = np.squeeze(input_image)  # Ensure 3D
         if input_image.ndim != 3 or input_image.shape[2] != 3:
             print(f"Error: Invalid image shape {input_image.shape} for job {job_id}")
