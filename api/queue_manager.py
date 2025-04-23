@@ -5,6 +5,7 @@ import uuid
 import numpy as np
 import logging  # Move logging import here
 from dataclasses import dataclass
+from typing import Optional  # 追加
 from PIL import Image
 
 from . import settings  # Import settings to get paths
@@ -39,6 +40,8 @@ class QueuedJob:
     progress_step: int = 0
     progress_total: int = 0  # Default to 0, will be set by worker
     progress_info: str = ""
+    lora_scale: float = 1.0  # 追加: LoRA強度
+    lora_path: Optional[str] = None    # 追加: LoRAファイルパス (Optional)
 
     def to_dict(self):
         try:
@@ -62,6 +65,8 @@ class QueuedJob:
                 'progress_step': self.progress_step,
                 'progress_total': self.progress_total,
                 'progress_info': self.progress_info,
+                'lora_scale': self.lora_scale,  # 追加
+                'lora_path': self.lora_path,     # 追加
             }
         except Exception as e:
             print(f"Error converting job to dict: {str(e)}")
@@ -89,7 +94,9 @@ class QueuedJob:
                 progress=data.get('progress', 0.0),
                 progress_step=data.get('progress_step', 0),
                 progress_total=data.get('progress_total', 0),
-                progress_info=data.get('progress_info', '')
+                progress_info=data.get('progress_info', ''),
+                lora_scale=data.get('lora_scale', 1.0),   # 追加
+                lora_path=data.get('lora_path', None)    # 追加
             )
         except Exception as e:
             print(f"Error creating job from dict: {str(e)}")
@@ -162,7 +169,7 @@ def save_image_to_temp(image: np.ndarray, job_id: str) -> str:
         return ""
 
 
-def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_preservation, steps, cfg, gs, rs, status="pending", mp4_crf=16):
+def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_preservation, steps, cfg, gs, rs, status="pending", mp4_crf=16, lora_scale: float = 1.0, lora_path: Optional[str] = None):    # 追加: lora_path 引数
     global job_queue
     try:
         # Generate a unique hex ID for the job
@@ -187,7 +194,9 @@ def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_pre
             gs=gs,
             rs=rs,
             status=status,
-            mp4_crf=mp4_crf
+            mp4_crf=mp4_crf,
+            lora_scale=lora_scale,
+            lora_path=lora_path       # 追加
         )
         job_queue.append(job)
         if not save_queue():  # Save immediately after adding

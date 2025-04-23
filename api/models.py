@@ -1,11 +1,8 @@
-import os
 import torch
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer, SiglipImageProcessor, SiglipVisionModel
-import argparse  # Keep for now if LoRA path comes from args, consider moving to settings
 
 from diffusers_helper.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller  # Removed cpu, load_model_as_complete
-from diffusers_helper.load_lora import load_lora
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 
 # Determine VRAM mode
@@ -20,11 +17,10 @@ FLUX_REDUX_BASE = "lllyasviel/flux_redux_bfl"
 FRAMEPACK_BASE = 'lllyasviel/FramePackI2V_HY'
 
 
-def load_models(lora_path: str = None):
+def load_models():
     """
-    Loads all necessary models and tokenizers.
-    Args:
-        lora_path (str, optional): Path to the LoRA file. Defaults to None.
+    Loads all necessary models and tokenizers (excluding LoRA).
+    LoRA is loaded dynamically by the worker based on job parameters.
     Returns:
         dict: A dictionary containing the loaded models and tokenizers.
     """
@@ -81,19 +77,7 @@ def load_models(lora_path: str = None):
     image_encoder.requires_grad_(False)
     transformer.requires_grad_(False)
 
-    # Load LoRA if specified
-    if lora_path:
-        if os.path.exists(lora_path):
-            print(f"Loading LoRA from: {lora_path}")
-            lora_dir, lora_name = os.path.split(lora_path)
-            try:
-                transformer = load_lora(transformer, lora_dir, lora_name)
-                print("LoRA loaded successfully.")
-            except Exception as e:
-                print(f"Error loading LoRA: {e}")
-                # Decide how to handle LoRA loading failure (e.g., continue without LoRA, raise error)
-        else:
-            print(f"Warning: LoRA path specified but not found: {lora_path}")
+    # LoRA loading moved to worker function
 
     # Move models to appropriate device based on VRAM
     if not high_vram:
@@ -132,12 +116,12 @@ if __name__ == '__main__':
     # You might need to handle HF_HOME environment variable here if running standalone
     # os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), '../hf_download')))
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lora", type=str, default=None, help="Lora path for testing")
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser() # LoRA path no longer needed here
+    # parser.add_argument("--lora", type=str, default=None, help="Lora path for testing")
+    # args = parser.parse_args()
 
     print("Testing model loading...")
-    loaded_models = load_models(lora_path=args.lora)
+    loaded_models = load_models()
     print(f"Models loaded: {list(loaded_models.keys())}")
     print(f"High VRAM mode detected: {loaded_models['high_vram']}")
     # Add more checks if needed, e.g., checking model devices

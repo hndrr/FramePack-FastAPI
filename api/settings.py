@@ -21,12 +21,14 @@ OUTPUTS_DIR = os.path.join(PROJECT_ROOT, 'outputs')
 TEMP_QUEUE_IMAGES_DIR = os.path.join(PROJECT_ROOT, 'temp_queue_images')
 QUEUE_FILE_PATH = os.path.join(PROJECT_ROOT, 'job_queue.json')
 HF_HOME_DIR = os.path.join(PROJECT_ROOT, 'hf_download')
+LORA_DIR = os.environ.get("LORA_DIR", os.path.join(PROJECT_ROOT, 'loras'))  # 追加: LoRAディレクトリ
 
 
 # Ensure directories exist (These should ideally be created outside the API module if they don't exist)
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 os.makedirs(TEMP_QUEUE_IMAGES_DIR, exist_ok=True)
 os.makedirs(HF_HOME_DIR, exist_ok=True)
+os.makedirs(LORA_DIR, exist_ok=True)  # 追加: LoRAディレクトリも作成
 
 # Set Hugging Face home directory environment variable
 os.environ['HF_HOME'] = HF_HOME_DIR
@@ -46,4 +48,5 @@ print(f"  Outputs Dir: {OUTPUTS_DIR}")
 print(f"  Temp Queue Images Dir: {TEMP_QUEUE_IMAGES_DIR}")
 print(f"  Queue File Path: {QUEUE_FILE_PATH}")
 print(f"  HF Home Dir: {HF_HOME_DIR}")
+print(f"  LoRA Dir: {LORA_DIR}")  # 追加
 print(f"  Worker Check Interval: {WORKER_CHECK_INTERVAL}")

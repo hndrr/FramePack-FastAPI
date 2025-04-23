@@ -9,7 +9,7 @@ import sys    # Import sys to modify sys.modules
 # import asyncio # Not directly used when only AsyncMock is needed
 from unittest.mock import AsyncMock  # For async context manager mock
 from PIL import Image
-from api import queue_manager
+from api import queue_manager, settings  # settings をインポート
 
 # Assuming your FastAPI app instance is named 'app' in 'api/api.py'
 from api.api import app
@@ -82,15 +82,24 @@ def create_dummy_image(width=100, height=50, format="PNG"):
 # --- Test cases will go below ---
 
 
-def test_generate_job_success(mocker):
+@pytest.mark.parametrize(
+    "lora_path_param, lora_scale_param, expected_lora_path_in_queue, expected_lora_scale_in_queue",
+    [
+        ("test_lora.safetensors", 0.8, "test_lora.safetensors", 0.8),  # Path and scale specified
+        ("another_lora.pt", None, "another_lora.pt", 1.0),       # Path specified, scale default
+        (None, None, None, 1.0),                                 # Path omitted, scale default (LoRA not applied by worker)
+        # ("", 0.5, "", 0.5), # Empty string path test removed based on latest logic
+    ]
+)
+def test_generate_job_success(mocker, lora_path_param, lora_scale_param, expected_lora_path_in_queue, expected_lora_scale_in_queue):
     """
-    Test successful job submission via the /generate endpoint.
+    Test successful job submission via the /generate endpoint with different LoRA parameters.
     Mocks the actual worker and queue manager add function.
     """
     # Mock the queue manager's add_to_queue function to return a predictable job_id
     # and prevent actual file saving/queue modification during test.
-    mock_job_id = "testjob123"
-    mocker.patch("api.queue_manager.add_to_queue", return_value=mock_job_id)
+    mock_job_id = f"testjob_{lora_path_param}_{lora_scale_param}"
+    mock_add_to_queue = mocker.patch("api.queue_manager.add_to_queue", return_value=mock_job_id)
 
     # Mock the worker function so it doesn't actually run the heavy process
     mock_worker = mocker.patch("api.worker.worker")
@@ -113,6 +122,11 @@ def test_generate_job_success(mocker):
         "rs": 1.0,
         "mp4_crf": 18.0,
     }
+    # Add LoRA params if they are not None
+    if lora_path_param is not None:
+        data["lora_path"] = lora_path_param
+    if lora_scale_param is not None:
+        data["lora_scale"] = lora_scale_param
 
     # Send the POST request
     response = client.post("/generate", data=data, files=files)
@@ -123,10 +137,24 @@ def test_generate_job_success(mocker):
     assert response_json["job_id"] == mock_job_id
     assert response_json["message"] == "Video generation job added to queue."
 
-    # Verify that add_to_queue was called (optional but good)
-    # We need to check the arguments it was called with if we want more specific tests
-    # For now, just check if it was called is implicitly done by checking the return value (job_id)
-    # queue_manager.add_to_queue.assert_called_once() # Requires importing queue_manager in test
+    # Verify that add_to_queue was called with the correct arguments
+    # Need to use mocker.ANY for the image numpy array as it's hard to replicate exactly
+    mock_add_to_queue.assert_called_once_with(
+        prompt=data["prompt"],
+        image=mocker.ANY,  # Check type later if needed: isinstance(call_args[1]['image'], np.ndarray)
+        video_length=data["video_length"],
+        seed=data["seed"],
+        use_teacache=data["use_teacache"],
+        gpu_memory_preservation=data["gpu_memory_preservation"],
+        steps=data["steps"],
+        cfg=data["cfg"],
+        gs=data["gs"],
+        rs=data["rs"],
+        mp4_crf=data["mp4_crf"],
+        lora_scale=expected_lora_scale_in_queue,  # Check expected scale
+        lora_path=expected_lora_path_in_queue,    # Check expected path
+        status="pending"
+    )
 
     # Verify that the worker was NOT called directly by the endpoint
     mock_worker.assert_not_called()
@@ -497,3 +525,61 @@ def test_get_worker_status_not_running(mocker):
     response_json = response.json()
     assert response_json["is_running"] is False
     assert response_json["processing_job_id"] is None
+
+
+# --- Tests for /loras endpoint ---
+
+def test_list_loras_success(mocker):
+    """Test the /loras endpoint successfully lists files."""
+    # Mock os.listdir to return dummy files
+    mock_lora_files = ["lora1.safetensors", "lora2.pt", "other_file.txt", "lora3.bin"]
+    mocker.patch("os.listdir", return_value=mock_lora_files)
+    # Mock os.path.isfile to return True for relevant files
+
+    def mock_isfile(path):
+        filename = os.path.basename(path)
+        # Check if the filename is in our mock list and has an extension
+        return filename in mock_lora_files and "." in filename
+    mocker.patch("os.path.isfile", side_effect=mock_isfile)
+    # Mock os.path.isdir to return True for the LORA_DIR
+    mocker.patch("os.path.isdir", return_value=True)
+    # Mock settings.LORA_DIR if needed, or assume it's set correctly
+    # mocker.patch("api.settings.LORA_DIR", "/fake/lora/dir")
+
+    response = client.get("/loras")
+
+    assert response.status_code == 200
+    response_json = response.json()
+    # Should only contain files with allowed extensions, sorted
+    expected_loras = ["lora1.safetensors", "lora2.pt", "lora3.bin"]
+    assert response_json["loras"] == expected_loras
+    # Verify listdir was called with the correct directory from settings
+    os.listdir.assert_called_once_with(settings.LORA_DIR)
+
+
+def test_list_loras_dir_not_found(mocker):
+    """Test the /loras endpoint when the LORA_DIR doesn't exist."""
+    # Mock os.path.isdir to return False
+    mocker.patch("os.path.isdir", return_value=False)
+    mock_listdir = mocker.patch("os.listdir")  # Ensure listdir is not called
+
+    response = client.get("/loras")
+
+    assert response.status_code == 200
+    response_json = response.json()
+    assert response_json["loras"] == []  # Should return empty list
+    mock_listdir.assert_not_called()  # listdir shouldn't be called if isdir is false
+
+
+def test_list_loras_exception(mocker):
+    """Test the /loras endpoint handles exceptions during listing."""
+    # Mock os.listdir to raise an exception
+    mocker.patch("os.listdir", side_effect=PermissionError("Test permission error"))
+    mocker.patch("os.path.isdir", return_value=True)  # Assume directory exists
+
+    response = client.get("/loras")
+
+    # The endpoint currently catches exceptions and returns empty list
+    assert response.status_code == 200
+    response_json = response.json()
+    assert response_json["loras"] == []
