@@ -13,7 +13,8 @@ thank you
 
 This fork includes a FastAPI server located in the `/api` directory to expose the video generation functionality via HTTP requests.
 
-![2025-04-23 221109](https://github.com/user-attachments/assets/32b78f12-6ae8-4b89-b5fd-f34b7ec3e77e)
+![Swagger](https://github.com/user-attachments/assets/3488e196-d026-45ee-b619-5e4db3e27fe3)
+
 
 ### Setup
 
