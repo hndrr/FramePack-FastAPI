@@ -83,7 +83,7 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI App Initialization ---
 # Use the lifespan context manager
-app = FastAPI(title="FramePack I2V API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="FramePack API", version="0.1.0", lifespan=lifespan)
 
 
 # --- Pydantic Models for API Requests/Responses ---
