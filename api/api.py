@@ -25,6 +25,8 @@ loaded_models = {}
 # Flag to indicate if the background worker is running
 worker_running = False
 worker_thread = None
+# Variable to store the ID of the currently processing job
+currently_processing_job_id: str | None = None
 
 # --- Pydantic Models for API Requests/Responses ---
 
@@ -61,29 +63,34 @@ class QueueStatusResponse(BaseModel):
 
 # --- Background Worker ---
 def background_worker_task():
-    global worker_running
+    global worker_running, currently_processing_job_id
     print("Background worker started.")
     while worker_running:
         next_job = queue_manager.get_next_job()
         if next_job:
-            print(f"Worker picked up job: {next_job.job_id}")
+            currently_processing_job_id = next_job.job_id  # Set current job ID
+            print(f"Worker picked up job: {currently_processing_job_id}")
             try:
                 # Ensure models are loaded before processing
                 if not loaded_models:
                     print("Error: Models not loaded. Cannot process job.")
-                    queue_manager.update_job_status(next_job.job_id, "failed - models not loaded")
+                    queue_manager.update_job_status(currently_processing_job_id, "failed - models not loaded")
+                    currently_processing_job_id = None  # Clear current job ID on error
                     continue  # Skip to next loop iteration
 
                 worker.worker(next_job, loaded_models)
             except Exception as e:
-                print(f"Unhandled exception in worker for job {next_job.job_id}: {e}")
+                print(f"Unhandled exception in worker for job {currently_processing_job_id}: {e}")
                 traceback.print_exc()
                 try:
                     # Attempt to mark the job as failed even if worker crashed
-                    queue_manager.update_job_status(next_job.job_id, f"failed - worker error: {type(e).__name__}")
+                    queue_manager.update_job_status(currently_processing_job_id, f"failed - worker error: {type(e).__name__}")
                 except Exception as update_e:
                     print(f"Critical: Failed to update job status after worker error: {update_e}")
-            print(f"Worker finished processing job: {next_job.job_id}")
+            finally:
+                # Ensure currently processing ID is cleared after job finishes (success or fail)
+                print(f"Worker finished processing job: {currently_processing_job_id}")
+                currently_processing_job_id = None
         else:
             # No job found, wait before checking again
             time.sleep(settings.WORKER_CHECK_INTERVAL)
@@ -203,16 +210,26 @@ async def generate_video(
 
 @app.get("/status/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
-    # Implementation needed: Fetch job status from queue_manager
-    job = queue_manager.get_job_by_id(job_id)
-    if not job:
-        # Check if the job might have completed and its output exists
-        output_file = os.path.join(settings.OUTPUTS_DIR, f"{job_id}.mp4")
-        if os.path.exists(output_file):
-            return JobStatusResponse(job_id=job_id, status="completed")
-        else:
-            raise HTTPException(status_code=404, detail="Job not found")
-    return JobStatusResponse(job_id=job.job_id, status=job.status)
+    """Checks the status of a job."""
+    global currently_processing_job_id
+
+    # 1. Check if it's the currently processing job
+    if job_id == currently_processing_job_id:
+        return JobStatusResponse(job_id=job_id, status="processing")
+
+    # 2. Check if the job exists in the queue file (pending)
+    job_in_file = queue_manager.get_job_from_file(job_id)
+    if job_in_file:
+        # Return the status from the file (usually 'pending' if not processing)
+        return JobStatusResponse(job_id=job_id, status=job_in_file.status)
+
+    # 3. Check if the output file exists (completed)
+    output_file = os.path.join(settings.OUTPUTS_DIR, f"{job_id}.mp4")
+    if os.path.exists(output_file):
+        return JobStatusResponse(job_id=job_id, status="completed")
+
+    # 4. If none of the above, the job is not found
+    raise HTTPException(status_code=404, detail="Job not found")
 
 
 @app.get("/result/{job_id}")

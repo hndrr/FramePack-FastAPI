@@ -251,8 +251,8 @@ def worker(job: queue_manager.QueuedJob, models: dict):
 
         # Sampling
         update_progress("Start sampling ...", 25)
-        # generator オブジェクトを再定義
-        rnd = torch.Generator(device=gpu).manual_seed(seed)  # Use GPU generator if possible
+        # generator オブジェクトをCPUで再定義 (demo_gradio.py に合わせる)
+        rnd = torch.Generator("cpu").manual_seed(seed)
         # num_frames を再定義
         num_frames = latent_window_size * 4 - 3
 
@@ -281,7 +281,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             )
 
             # Check for cancellation signal (e.g., if job status is set to 'cancelled')
-            current_job_status = queue_manager.get_job_by_id(job_id)
+            current_job_status = queue_manager.get_job_from_file(job_id)  # Use renamed function
             if current_job_status and current_job_status.status == "cancelled":
                 print(f"Job {job_id} cancelled during sampling.")
                 # No need to update status again, it's already 'cancelled'
@@ -334,23 +334,16 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             else:
                 transformer.initialize_teacache(enable_teacache=False)
 
-            # K-Diffusion Sampling Callback
+            # K-Diffusion Sampling Callback (Simplified for API, console output only)
             def callback(d):
-                step = d["i"]
-                total = d["total"]
-                current_progress = (
-                    section_progress_start
-                    + (step / total)
-                    * (section_progress_end - section_progress_start)
-                    * 0.9
-                )  # Allocate 90% of section time to sampling
-                update_progress(
-                    f"Sampling section {current_sampling_step}/{sampling_step_count} - Step {step+1}/{total}",
-                    current_progress,
-                )
+                step = d['i']
+                total = d['total']
+                percentage = int(100.0 * (step + 1) / total)
+                hint = f'Sampling section {current_sampling_step}/{sampling_step_count} - Step {step+1}/{total}'
+                print(f"Job {job_id} Progress: {hint} ({percentage}%)")  # Simple console log
 
                 # Check for cancellation signal within callback
-                current_job_status_inner = queue_manager.get_job_by_id(job_id)
+                current_job_status_inner = queue_manager.get_job_from_file(job_id)  # Use renamed function
                 if (
                     current_job_status_inner
                     and current_job_status_inner.status == "cancelled"
@@ -359,13 +352,6 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                     raise InterruptedError(
                         "Job cancelled"
                     )  # Raise exception to stop sampling
-
-                # Original callback logic (if any) can go here
-                # Example: preview generation (might be complex for API)
-                # if step % 10 == 0:
-                #     latents = d['denoised']
-                #     pixels = vae_decode_fake(latents, vae)  # Use fake decode for speed
-                #     # Send preview update (how depends on API design)
 
             try:
                 # --- 引数チェックは一旦コメントアウト ---
@@ -381,7 +367,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                 # --- sample_hunyuan 呼び出し方を demo_gradio.py に合わせる ---
                 generated_latents = sample_hunyuan(
                     transformer=transformer,  # キーワード引数で渡す
-                    sampler='unipc',  # demo_gradio.py から追加
+                    sampler='unipc',  # demo_gradio.py に合わせる
                     width=width,  # demo_gradio.py から追加
                     height=height,  # demo_gradio.py から追加
                     frames=num_frames,  # demo_gradio.py から追加 (再定義した変数を使用)
@@ -397,7 +383,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                     negative_prompt_embeds_mask=llama_attention_mask_n,  # 引数名を修正
                     negative_prompt_poolers=clip_l_pooler_n,  # 引数名を修正
                     device=gpu,  # demo_gradio.py から追加
-                    dtype=transformer.dtype,  # demo_gradio.py から追加 (transformer の dtype を使用)
+                    dtype=torch.bfloat16,  # demo_gradio.py に合わせて明示的に指定
                     image_embeddings=image_encoder_last_hidden_state,  # 引数名を修正
                     latent_indices=latent_indices,  # demo_gradio.py から追加 (ループ内で計算される)
                     clean_latents=clean_latents,  # キーワード引数
@@ -406,17 +392,17 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                     clean_latent_2x_indices=clean_latent_2x_indices,  # キーワード引数
                     clean_latents_4x=clean_latents_4x,  # キーワード引数
                     clean_latent_4x_indices=clean_latent_4x_indices,  # キーワード引数
-                    callback=callback,  # キーワード引数
+                    callback=callback,  # コールバックを再度有効化 (簡易版)
                     # --- 不要な引数を削除 ---
                     # seed=seed + current_sampling_step,
-                    # sampler_name='dpmpp_2m_sde',
-                    # scheduler_name='karras',
-                    # latent_image=start_latent,
+                    # sampler_name='dpmpp_2m_sde', # sampler='unipc' を使用
+                    # scheduler_name='karras', # sampler='unipc' を使用
+                    # latent_image=start_latent, # 不要 (内部で処理される)
                     # positive_image_encoder_hidden_states=image_encoder_last_hidden_state,
                     # negative_image_encoder_hidden_states=torch.zeros_like(image_encoder_last_hidden_state),
-                    # latent_padding_size=latent_padding_size,
-                    # latent_window_size=latent_window_size,
-                    # disable_pbar=True
+                    # latent_padding_size=latent_padding_size, # 不要 (内部で処理される)
+                    # latent_window_size=latent_window_size, # 不要 (内部で処理される)
+                    # disable_pbar=True # 不要
                 )
                 # --- 呼び出し修正ここまで ---
             except InterruptedError:

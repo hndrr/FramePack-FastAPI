@@ -103,20 +103,18 @@ def save_queue():
         return False
 
 
-def load_queue():
-    global job_queue
+def load_queue_from_file() -> list[QueuedJob]:
+    """Loads the queue from the JSON file and returns it as a list."""
     try:
         if os.path.exists(QUEUE_FILE):
             with open(QUEUE_FILE, 'r') as f:
                 jobs_data = json.load(f)
-            # Clear existing queue and load jobs from file
-            current_queue = []
+            loaded_queue = []
             for job_data in jobs_data:
                 job = QueuedJob.from_dict(job_data)
                 if job is not None:
-                    current_queue.append(job)
-            job_queue = current_queue  # Assign the loaded queue
-            return job_queue
+                    loaded_queue.append(job)
+            return loaded_queue
         return []
     except Exception as e:
         print(f"Error loading queue: {str(e)}")
@@ -124,8 +122,8 @@ def load_queue():
         return []
 
 
-# Load existing queue on startup
-job_queue = load_queue()
+# Load existing queue on startup into the global variable
+job_queue = load_queue_from_file()
 
 
 def save_image_to_temp(image: np.ndarray, job_id: str) -> str:
@@ -188,6 +186,7 @@ def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_pre
 
 
 def get_next_job():
+    """Gets the next job from the global in-memory queue, removes it, and saves the queue."""
     global job_queue
     try:
         if job_queue:
@@ -201,43 +200,74 @@ def get_next_job():
         return None
 
 
-def get_job_by_id(job_id: str) -> QueuedJob | None:
-    global job_queue
-    for job in job_queue:
-        if job.job_id == job_id:
-            return job
-    # If not in memory queue, try loading from file again (in case another process updated it)
-    load_queue()
-    for job in job_queue:
+def get_job_from_file(job_id: str) -> QueuedJob | None:
+    """Finds a job by its ID by reading the queue file directly."""
+    current_queue = load_queue_from_file()
+    for job in current_queue:
         if job.job_id == job_id:
             return job
     return None
 
 
 def update_job_status(job_id: str, status: str, thumbnail: str = None):
+    """Updates the status (and optionally thumbnail) of a job in the global queue and saves the file."""
     global job_queue
-    job_updated = True  # Assume update will succeed initially
+    job_updated = False  # Changed initial value to False
+    job_found_in_memory = False
     for job in job_queue:
         if job.job_id == job_id:
             job.status = status
             if thumbnail:
                 job.thumbnail = thumbnail
             job_updated = True
+            job_found_in_memory = True
             break
+
     if job_updated:
-        save_queue()
-    else:
-        print(f"Job with ID {job_id} not found in queue for status update.")
+        save_queue()  # Save if updated in memory
+
+    # If not found or updated in memory, try loading from file, updating, and saving
+    if not job_found_in_memory:
+        current_queue = load_queue_from_file()
+        job_found_in_file = False
+        for job in current_queue:
+            if job.job_id == job_id:
+                job.status = status
+                if thumbnail:
+                    job.thumbnail = thumbnail
+                job_found_in_file = True
+                break
+
+        if job_found_in_file:
+            # Overwrite the file with the updated list
+            try:
+                jobs_to_save = [j.to_dict() for j in current_queue if j.to_dict() is not None]
+                file_path = os.path.abspath(QUEUE_FILE)
+                with open(file_path, 'w') as f:
+                    json.dump(jobs_to_save, f, indent=2)
+                job_updated = True  # Mark as updated since we saved the file
+                # Update the global in-memory queue as well
+                job_queue = current_queue  # Update global variable after successful save
+            except Exception as e:
+                print(f"Error saving queue after updating job {job_id} found in file: {e}")
+                traceback.print_exc()
+                job_updated = False  # Ensure update status reflects save failure
+        else:
+            print(f"Job with ID {job_id} not found in memory or file for status update.")
+
     return job_updated
 
 
 def get_queue_status():
     """Returns a list of job statuses and basic info."""
     global job_queue
-    # Ensure the queue is up-to-date
-    load_queue()
+    # Load the latest queue to ensure we have the most recent list in memory
+    # Note: This might overwrite changes made by other processes if not careful,
+    # but it's necessary for get_queue_status to be accurate.
+    # Consider locking mechanisms for multi-worker scenarios.
+    load_queue_from_file()  # Reload global job_queue
     status_list = []
-    for job in job_queue:
+    for job in job_queue:  # Iterate over the reloaded global queue
         status_list.append({
             "job_id": job.job_id,
             "status": job.status,
@@ -259,9 +289,9 @@ def update_queue_display():
     global job_queue
     try:
         # Reload queue to ensure it's current
-        load_queue()
+        load_queue_from_file()  # Reload global job_queue
         queue_data = []
-        for job in job_queue:
+        for job in job_queue:  # Iterate over the reloaded global queue
             # Create thumbnail if it doesn't exist and image path is valid
             if not job.thumbnail and job.image_path and os.path.exists(job.image_path):
                 try:
