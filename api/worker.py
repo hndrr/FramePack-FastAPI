@@ -69,7 +69,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     n_prompt = ""  # Default negative prompt
     seed = job.seed
     total_second_length = job.video_length
-    latent_window_size = 16
+    latent_window_size = 9
     steps = job.steps
     cfg = job.cfg
     gs = job.gs

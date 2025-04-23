@@ -171,10 +171,10 @@ async def generate_video(
     seed: int = Form(-1),
     use_teacache: bool = Form(True),  # Default to True (matching demo_gradio.py)
     gpu_memory_preservation: float = Form(6.0),  # Default to 6.0 GB (matching demo_gradio.py)
-    steps: int = Form(20),
-    cfg: float = Form(7.0),
-    gs: float = Form(1.0),
-    rs: float = Form(1.0),
+    steps: int = Form(25),
+    cfg: float = Form(1.0),
+    gs: float = Form(10.0),
+    rs: float = Form(0.0),
     mp4_crf: float = Form(16.0),
     image: UploadFile = File(...)
 ):
