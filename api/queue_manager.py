@@ -59,7 +59,7 @@ class QueuedJob:
     def from_dict(cls, data):
         try:
             return cls(
-                prompt=data.get('prompt', 'dancing'),  # Set default prompt to "dancing"
+                prompt=data.get('prompt', 'A character doing some simple body movements.'),  # Set default prompt
                 image_path=data.get('image_path', ''),
                 video_length=data.get('video_length', 5.0),
                 job_id=data.get('job_id', uuid.uuid4().hex[:8]),  # Provide default if missing
