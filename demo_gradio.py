@@ -43,9 +43,11 @@ import argparse
 import math
 
 from PIL import Image, ImageDraw, ImageFont
+from PIL.PngImagePlugin import PngInfo
 from diffusers import AutoencoderKLHunyuanVideo
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
+from diffusers_helper.load_lora import load_lora
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
@@ -292,6 +294,7 @@ parser.add_argument('--share', action='store_true')
 parser.add_argument("--server", type=str, default='0.0.0.0')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
+parser.add_argument("--lora", type=str, default=None, help="Lora path")
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -340,6 +343,12 @@ text_encoder.requires_grad_(False)
 text_encoder_2.requires_grad_(False)
 image_encoder.requires_grad_(False)
 transformer.requires_grad_(False)
+
+if args.lora:
+    lora = args.lora
+    lora_path, lora_name = os.path.split(lora)
+    print("Loading lora")
+    transformer = load_lora(transformer, lora_path, lora_name)
 
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
@@ -400,8 +409,11 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
         height, width = find_nearest_bucket(H, W, resolution=640)
         input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
-        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
+        metadata = PngInfo()
+        metadata.add_text("prompt", prompt)
+        metadata.add_text("seed", str(seed))
 
+        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'), pnginfo=metadata)
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
