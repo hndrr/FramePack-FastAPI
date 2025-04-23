@@ -43,7 +43,7 @@ uvicorn api.api:app --host 0.0.0.0 --port 8080 --reload
 
 Once the server is running, you can access the interactive API documentation (Swagger UI) in your browser at:
 
-[http://localhost:8000/docs](http://localhost:8080/docs)
+[http://localhost:8080/docs](http://localhost:8080/docs)
 
 From there, you can test the available API endpoints (`/generate`, `/status/{job_id}`, `/result/{job_id}`, `/queue`).
 
