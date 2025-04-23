@@ -1,4 +1,4 @@
-# FramePack (with FastAPI API Fork)
+# [WIP] FramePack (with FastAPI API Fork)
 
 **Note:** This is a fork of the original [FramePack](https://github.com/lllyasviel/FramePack) project, adding a FastAPI-based API for video generation. The original README content follows below.
 
@@ -6,13 +6,16 @@
 
 This fork includes a FastAPI server located in the `/api` directory to expose the video generation functionality via HTTP requests.
 
+![2025-04-23 150334](https://github.com/user-attachments/assets/03f75b70-0073-442e-b86d-365abccac61d)
+
+
 ### Setup
 
 Ensure you have installed the necessary dependencies, including those for the API:
 
 ```bash
 # Activate your virtual environment (example for Windows)
-venv\Scripts\activate 
+.\venv\Scripts\activate 
 
 # Install dependencies (includes fastapi, uvicorn added previously)
 pip install -r requirements.txt 
