@@ -1,8 +1,6 @@
 import os
 import torch
 import numpy as np
-# import einops  # Unused
-# import safetensors.torch as sf  # Unused
 from PIL import Image  # Removed ImageDraw, ImageFont
 from PIL.PngImagePlugin import PngInfo
 import traceback
@@ -16,17 +14,15 @@ from diffusers_helper.hunyuan import (
     encode_prompt_conds,
     vae_decode,
     vae_encode,
-    # vae_decode_fake, # Unused in current API worker
 )
-# from diffusers_helper.load_lora import load_lora  # Unused
+
 from diffusers_helper.utils import (
     save_bcthw_as_mp4,
     crop_or_pad_yield_mask,
     resize_and_center_crop,
     soft_append_bcthw,
-)  # Removed generate_timestamp, Added soft_append_bcthw
+)
 
-# from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked  # Unused
 from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from diffusers_helper.memory import (
     gpu,
@@ -35,10 +31,8 @@ from diffusers_helper.memory import (
     fake_diffusers_current_device,
     unload_complete_models,
     load_model_as_complete,
-)  # Removed cpu, offload_..., DynamicSwapInstaller
+)
 
-# from diffusers_helper.thread_utils import AsyncStream, async_run  # Removed stream
-# from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html  # Unused
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
 
@@ -74,8 +68,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     n_prompt = ""  # Default negative prompt
     seed = job.seed
     total_second_length = job.video_length
-    # latent_window_size = job.latent_window_size  # Assuming this might be added or defaulted
-    latent_window_size = 16  # Default value from demo_gradio
+    latent_window_size = 16
     steps = job.steps
     cfg = job.cfg
     gs = job.gs
@@ -251,9 +244,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
 
         # Sampling
         update_progress("Start sampling ...", 25)
-        # generator オブジェクトをCPUで再定義 (demo_gradio.py に合わせる)
         rnd = torch.Generator("cpu").manual_seed(seed)
-        # num_frames を再定義
         num_frames = latent_window_size * 4 - 3
 
         history_latents = torch.zeros(
@@ -266,7 +257,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         if total_latent_sections > 4:
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
         else:
-            latent_paddings = list(latent_paddings)  # Convert range_iterator to list
+            latent_paddings = list(latent_paddings)
 
         sampling_step_count = len(latent_paddings)
         current_sampling_step = 0
@@ -344,17 +335,13 @@ def worker(job: queue_manager.QueuedJob, models: dict):
 
                 # Check for cancellation signal within callback
                 current_job_status_inner = queue_manager.get_job_by_id(job_id)  # Use the function that reads the file
-                if (
-                    current_job_status_inner
-                    and current_job_status_inner.status == "cancelled"
-                ):
+                if current_job_status_inner and current_job_status_inner.status == "cancelled":
                     print(f"Job {job_id} cancelled during sampling step {step+1}.")
                     raise InterruptedError(
                         "Job cancelled"
                     )  # Raise exception to stop sampling
 
             try:
-                # --- 引数チェックは一旦コメントアウト ---
                 # args_to_check = { ... }
                 # none_args = [name for name, val in args_to_check.items() if val is None]
                 # if none_args:
@@ -362,50 +349,39 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                 #     print(error_msg)
                 #     queue_manager.update_job_status(job_id, "failed - internal error (None arg)")
                 #     return # Stop processing this section
-                # --- End comprehensive check ---
 
-                # --- sample_hunyuan 呼び出し方を demo_gradio.py に合わせる ---
                 generated_latents = sample_hunyuan(
-                    transformer=transformer,  # キーワード引数で渡す
-                    sampler='unipc',  # demo_gradio.py に合わせる
-                    # sampler_name='dpmpp_2m_sde', # 不要
-                    # scheduler_name='karras',    # 不要
-                    width=width,  # demo_gradio.py から追加
-                    height=height,  # demo_gradio.py から追加
-                    frames=num_frames,  # demo_gradio.py から追加 (再定義した変数を使用)
-                    real_guidance_scale=cfg,  # demo_gradio.py から追加 (cfg を使用)
-                    distilled_guidance_scale=gs,  # 引数名を修正 (gs を使用)
-                    guidance_rescale=rs,  # 引数名を修正 (rs を使用)
-                    num_inference_steps=steps,  # 引数名を修正 (steps を使用)
-                    generator=rnd,  # demo_gradio.py から追加 (再定義した変数を使用)
-                    prompt_embeds=llama_vec,  # 引数名を修正
-                    prompt_embeds_mask=llama_attention_mask,  # 引数名を修正
-                    prompt_poolers=clip_l_pooler,  # 引数名を修正
-                    negative_prompt_embeds=llama_vec_n,  # 引数名を修正
-                    negative_prompt_embeds_mask=llama_attention_mask_n,  # 引数名を修正
-                    negative_prompt_poolers=clip_l_pooler_n,  # 引数名を修正
-                    device=gpu,  # demo_gradio.py から追加
-                    dtype=torch.bfloat16,  # demo_gradio.py に合わせて明示的に指定
-                    image_embeddings=image_encoder_last_hidden_state,  # 引数名を修正
-                    latent_indices=latent_indices,  # demo_gradio.py から追加 (ループ内で計算される)
-                    clean_latents=clean_latents,  # キーワード引数
-                    clean_latent_indices=clean_latent_indices,  # キーワード引数
-                    clean_latents_2x=clean_latents_2x,  # キーワード引数
-                    clean_latent_2x_indices=clean_latent_2x_indices,  # キーワード引数
-                    clean_latents_4x=clean_latents_4x,  # キーワード引数
-                    clean_latent_4x_indices=clean_latent_4x_indices,  # キーワード引数
-                    callback=callback,  # コールバックを再度有効化 (簡易版)
-                    # --- 不要な引数を削除 ---
+                    transformer=transformer,
+                    sampler='unipc',
+                    width=width,
+                    height=height,
+                    frames=num_frames,
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=gs,
+                    guidance_rescale=rs,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=gpu,
+                    dtype=torch.bfloat16,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
                     # seed=seed + current_sampling_step,
-                    # sampler='unipc', # dpmpp_2m_sde を試す
-                    # latent_image=start_latent, # 不要 (内部で処理される)
                     # positive_image_encoder_hidden_states=image_encoder_last_hidden_state,
                     # negative_image_encoder_hidden_states=torch.zeros_like(image_encoder_last_hidden_state),
-                    # latent_padding_size=latent_padding_size, # 不要 (内部で処理される)
-                    # latent_window_size=latent_window_size, # 不要 (内部で処理される)
-                    # disable_pbar=True # 不要
                 )
-                # --- 呼び出し修正ここまで ---
             except InterruptedError:
                 # Job was cancelled during sampling via callback
                 return  # Exit worker function
@@ -417,7 +393,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             update_progress(
                 f"VAE decoding section {current_sampling_step}/{sampling_step_count}",
                 section_progress_end - 1,
-            )  # Just before finishing section
+            )
             if not high_vram:
                 unload_complete_models()
                 load_model_as_complete(vae, target_device=gpu)
