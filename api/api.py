@@ -305,6 +305,30 @@ async def get_job_result(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found or result file does not exist.")
 
 
+@app.get("/input_image/{job_id}")
+async def get_input_image(job_id: str):
+    """
+    Returns the input PNG image file associated with a job, including embedded metadata.
+    """
+    job = queue_manager.get_job_by_id(job_id)
+
+    if not job:
+        # Check if the image file exists even if job is not in queue (e.g., after cleanup)
+        # This might be less common for input images compared to output files.
+        input_image_path = os.path.join(settings.TEMP_QUEUE_IMAGES_DIR, f"queue_image_{job_id}.png")
+        if os.path.exists(input_image_path):
+            print(f"Job {job_id} not in queue, but input image file found. Serving file.")
+            return FileResponse(input_image_path, media_type="image/png", filename=f"input_{job_id}.png")
+        else:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    input_image_path = job.image_path
+    if not input_image_path or not os.path.exists(input_image_path):
+        raise HTTPException(status_code=404, detail=f"Input image file not found for job '{job_id}'.")
+
+    return FileResponse(input_image_path, media_type="image/png", filename=f"input_{job_id}.png")
+
+
 @app.get("/queue", response_model=QueueStatusResponse)
 async def get_queue_info():
     # Implementation needed: Get queue status from queue_manager
@@ -378,7 +402,22 @@ async def list_loras():
         print(f"Error listing LoRA files: {e}")
         # Return empty list on error, or raise HTTPException
         # raise HTTPException(status_code=500, detail=f"Failed to list LoRA files: {e}")
-    return LoraListResponse(loras=lora_files)
+    return LoraListResponse(loras=lora_files)  # Correct indentation for return
+
+
+@app.post("/cleanup_jobs", status_code=200)
+async def trigger_cleanup_jobs():
+    """ # Correct indentation for docstring
+    Manually triggers the cleanup of old completed, cancelled, or failed jobs
+    based on the MAX_COMPLETED_JOBS setting.
+    """
+    try:  # Correct indentation for try block
+        removed_count = queue_manager.cleanup_jobs_by_max_count()
+        return {"message": f"Cleanup process completed. Removed {removed_count} old job entries."}
+    except Exception as e:
+        print(f"Error during manual job cleanup: {e}")  # Correct indentation
+        traceback.print_exc()  # Correct indentation
+        raise HTTPException(status_code=500, detail=f"Failed to perform job cleanup: {e}")  # Correct indentation
 
 
 # --- Main execution (for running with uvicorn) ---

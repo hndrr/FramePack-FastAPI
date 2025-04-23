@@ -47,3 +47,8 @@ print(f"  Queue File Path: {QUEUE_FILE_PATH}")
 print(f"  HF Home Dir: {HF_HOME_DIR}")
 print(f"  LoRA Dir: {LORA_DIR}")
 print(f"  Worker Check Interval: {WORKER_CHECK_INTERVAL}")
+
+# --- Job Cleanup Settings ---
+# Maximum number of completed, cancelled, or failed jobs to keep in the queue file.
+# Older jobs beyond this limit will be removed when cleanup is triggered.
+MAX_COMPLETED_JOBS: int = int(os.getenv("MAX_COMPLETED_JOBS", 1000))
