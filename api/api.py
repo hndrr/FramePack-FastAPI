@@ -145,11 +145,11 @@ def shutdown_event():
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_video(
     background_tasks: BackgroundTasks,
-    prompt: str = Form(...),
+    prompt: str = Form("dancing"),  # Set default prompt to "dancing"
     video_length: float = Form(5.0),
     seed: int = Form(-1),
-    use_teacache: bool = Form(False),
-    gpu_memory_preservation: float = Form(0.0),
+    use_teacache: bool = Form(True),  # Default to True (matching demo_gradio.py)
+    gpu_memory_preservation: float = Form(6.0),  # Default to 6.0 GB (matching demo_gradio.py)
     steps: int = Form(20),
     cfg: float = Form(7.0),
     gs: float = Form(1.0),
@@ -218,7 +218,7 @@ async def get_job_status(job_id: str):
         return JobStatusResponse(job_id=job_id, status="processing")
 
     # 2. Check if the job exists in the queue file (pending)
-    job_in_file = queue_manager.get_job_from_file(job_id)
+    job_in_file = queue_manager.get_job_by_id(job_id)  # Use the renamed function that reads file
     if job_in_file:
         # Return the status from the file (usually 'pending' if not processing)
         return JobStatusResponse(job_id=job_id, status=job_in_file.status)

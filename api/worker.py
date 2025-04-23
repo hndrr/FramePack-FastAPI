@@ -281,7 +281,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             )
 
             # Check for cancellation signal (e.g., if job status is set to 'cancelled')
-            current_job_status = queue_manager.get_job_from_file(job_id)  # Use renamed function
+            current_job_status = queue_manager.get_job_by_id(job_id)  # Use the function that reads the file
             if current_job_status and current_job_status.status == "cancelled":
                 print(f"Job {job_id} cancelled during sampling.")
                 # No need to update status again, it's already 'cancelled'
@@ -337,13 +337,13 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             # K-Diffusion Sampling Callback (Simplified for API, console output only)
             def callback(d):
                 step = d['i']
-                total = d['total']
-                percentage = int(100.0 * (step + 1) / total)
-                hint = f'Sampling section {current_sampling_step}/{sampling_step_count} - Step {step+1}/{total}'
+                # total = d['total']  # 'total' key is not provided by the sampler callback
+                percentage = int(100.0 * (step + 1) / steps)  # Use 'steps' variable directly
+                hint = f'Sampling section {current_sampling_step}/{sampling_step_count} - Step {step+1}/{steps}'  # Use 'steps' variable directly
                 print(f"Job {job_id} Progress: {hint} ({percentage}%)")  # Simple console log
 
                 # Check for cancellation signal within callback
-                current_job_status_inner = queue_manager.get_job_from_file(job_id)  # Use renamed function
+                current_job_status_inner = queue_manager.get_job_by_id(job_id)  # Use the function that reads the file
                 if (
                     current_job_status_inner
                     and current_job_status_inner.status == "cancelled"
@@ -368,6 +368,8 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                 generated_latents = sample_hunyuan(
                     transformer=transformer,  # キーワード引数で渡す
                     sampler='unipc',  # demo_gradio.py に合わせる
+                    # sampler_name='dpmpp_2m_sde', # 不要
+                    # scheduler_name='karras',    # 不要
                     width=width,  # demo_gradio.py から追加
                     height=height,  # demo_gradio.py から追加
                     frames=num_frames,  # demo_gradio.py から追加 (再定義した変数を使用)
@@ -395,8 +397,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                     callback=callback,  # コールバックを再度有効化 (簡易版)
                     # --- 不要な引数を削除 ---
                     # seed=seed + current_sampling_step,
-                    # sampler_name='dpmpp_2m_sde', # sampler='unipc' を使用
-                    # scheduler_name='karras', # sampler='unipc' を使用
+                    # sampler='unipc', # dpmpp_2m_sde を試す
                     # latent_image=start_latent, # 不要 (内部で処理される)
                     # positive_image_encoder_hidden_states=image_encoder_last_hidden_state,
                     # negative_image_encoder_hidden_states=torch.zeros_like(image_encoder_last_hidden_state),

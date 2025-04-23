@@ -59,12 +59,12 @@ class QueuedJob:
     def from_dict(cls, data):
         try:
             return cls(
-                prompt=data.get('prompt', ''),
+                prompt=data.get('prompt', 'dancing'),  # Set default prompt to "dancing"
                 image_path=data.get('image_path', ''),
                 video_length=data.get('video_length', 5.0),
                 job_id=data.get('job_id', uuid.uuid4().hex[:8]),  # Provide default if missing
                 seed=data.get('seed', -1),
-                use_teacache=data.get('use_teacache', False),
+                use_teacache=data.get('use_teacache', True),  # Default to True
                 gpu_memory_preservation=data.get('gpu_memory_preservation', 0.0),
                 steps=data.get('steps', 20),
                 cfg=data.get('cfg', 7.0),
@@ -200,9 +200,9 @@ def get_next_job():
         return None
 
 
-def get_job_from_file(job_id: str) -> QueuedJob | None:
+def get_job_by_id(job_id: str) -> QueuedJob | None:
     """Finds a job by its ID by reading the queue file directly."""
-    current_queue = load_queue_from_file()
+    current_queue = load_queue_from_file()  # Always read from file for this check
     for job in current_queue:
         if job.job_id == job_id:
             return job
