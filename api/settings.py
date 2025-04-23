@@ -9,7 +9,7 @@ load_dotenv(dotenv_path=dotenv_path)
 
 # API Server Settings
 API_HOST = "0.0.0.0"  # Listen on all available network interfaces
-API_PORT = 8000       # Default port for the API server
+API_PORT = int(os.environ.get("API_PORT", 8000))  # Load from env var, default to 8000
 
 # Model Settings (Consider making these paths absolute or relative to a known root)
 # LORA_PATH = None  # Example: Set path if LoRA is always used, or load from env/config
