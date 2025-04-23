@@ -2,7 +2,7 @@
 
 **Note:** This is a fork of the original [FramePack](https://github.com/lllyasviel/FramePack) project, adding a FastAPI-based API for video generation. The original README content follows below.
 
-features PR:
+The following PRs have been imported:
 - https://github.com/lllyasviel/FramePack/pull/157
 - https://github.com/lllyasviel/FramePack/pull/218
 - https://github.com/lllyasviel/FramePack/pull/178
