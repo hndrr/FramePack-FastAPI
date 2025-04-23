@@ -12,7 +12,7 @@ Ensure you have installed the necessary dependencies, including those for the AP
 
 ```bash
 # Activate your virtual environment (example for Windows)
-venv\Scripts\activate 
+.\venv\Scripts\activate 
 
 # Install dependencies (includes fastapi, uvicorn added previously)
 pip install -r requirements.txt 
