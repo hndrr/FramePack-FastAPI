@@ -3,10 +3,12 @@ import json
 import traceback
 import uuid
 import numpy as np
-import logging  # Move logging import here
-from dataclasses import dataclass
-from typing import Optional  # 追加
+import logging
+from dataclasses import dataclass, field  # Import field
+from typing import Optional
+from datetime import datetime, timezone  # Import datetime and timezone
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 from . import settings  # Import settings to get paths
 
@@ -41,10 +43,14 @@ class QueuedJob:
     progress_total: int = 0  # Default to 0, will be set by worker
     progress_info: str = ""
     lora_scale: float = 1.0  # 追加: LoRA強度
-    lora_path: Optional[str] = None    # 追加: LoRAファイルパス (Optional)
+    lora_path: Optional[str] = None
+    # Add updated_at timestamp, default to current UTC time
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_dict(self):
         try:
+            # Convert datetime to ISO 8601 string format for JSON serialization
+            updated_at_iso = self.updated_at.isoformat() if self.updated_at else None
             return {
                 'prompt': self.prompt,
                 'image_path': self.image_path,
@@ -66,7 +72,8 @@ class QueuedJob:
                 'progress_total': self.progress_total,
                 'progress_info': self.progress_info,
                 'lora_scale': self.lora_scale,  # 追加
-                'lora_path': self.lora_path,     # 追加
+                'lora_path': self.lora_path,
+                'updated_at': updated_at_iso,  # Add updated_at
             }
         except Exception as e:
             print(f"Error converting job to dict: {str(e)}")
@@ -75,8 +82,27 @@ class QueuedJob:
     @classmethod
     def from_dict(cls, data):
         try:
+            # Convert ISO 8601 string back to datetime object
+            updated_at_iso = data.get('updated_at')
+            updated_at_dt = None
+            if updated_at_iso:
+                try:
+                    # Handle potential 'Z' suffix for UTC
+                    if updated_at_iso.endswith('Z'):
+                        updated_at_iso = updated_at_iso[:-1] + '+00:00'
+                    updated_at_dt = datetime.fromisoformat(updated_at_iso)
+                    # Ensure timezone-aware (assume UTC if no timezone info)
+                    if updated_at_dt.tzinfo is None:
+                        updated_at_dt = updated_at_dt.replace(tzinfo=timezone.utc)  # Corrected indentation and comment space
+                except ValueError:
+                    print(f"Warning: Could not parse updated_at timestamp '{updated_at_iso}'. Using current time.")
+                    updated_at_dt = datetime.now(timezone.utc)
+            else:
+                # If updated_at is missing, default to now
+                updated_at_dt = datetime.now(timezone.utc)
+
             return cls(
-                prompt=data.get('prompt', 'A character doing some simple body movements.'),  # Set default prompt
+                prompt=data.get('prompt', 'A character doing some simple body movements.'),
                 image_path=data.get('image_path', ''),
                 video_length=data.get('video_length', 5.0),
                 job_id=data.get('job_id', uuid.uuid4().hex[:8]),  # Provide default if missing
@@ -96,7 +122,8 @@ class QueuedJob:
                 progress_total=data.get('progress_total', 0),
                 progress_info=data.get('progress_info', ''),
                 lora_scale=data.get('lora_scale', 1.0),   # 追加
-                lora_path=data.get('lora_path', None)    # 追加
+                lora_path=data.get('lora_path', None),
+                updated_at=updated_at_dt  # Add updated_at
             )
         except Exception as e:
             print(f"Error creating job from dict: {str(e)}")
@@ -150,21 +177,29 @@ def load_queue_from_file() -> list[QueuedJob]:
 job_queue = load_queue_from_file()
 
 
-def save_image_to_temp(image: np.ndarray, job_id: str) -> str:
-    """Save image to temp directory and return the path"""
+def save_image_to_temp(image: np.ndarray, job_id: str, prompt: str, seed: int) -> str:
+    """Save image to temp directory with metadata and return the path"""
     try:
         # Convert numpy array to PIL Image
-        # Remove single-dimensional entries from the shape of an array
         squeezed_image = np.squeeze(image)
         pil_image = Image.fromarray(squeezed_image)
+
+        # Create metadata
+        metadata = PngInfo()
+        metadata.add_text("prompt", prompt)
+        metadata.add_text("seed", str(seed))
+        # Add other relevant info if needed, e.g., job_id
+        metadata.add_text("job_id", job_id)
+
         # Create unique filename using hex ID
         filename = f"queue_image_{job_id}.png"
         filepath = os.path.join(temp_queue_images, filename)
-        # Save image
-        pil_image.save(filepath)
+
+        # Save image with metadata
+        pil_image.save(filepath, pnginfo=metadata)
         return filepath
     except Exception as e:
-        print(f"Error saving image: {str(e)}")
+        print(f"Error saving image with metadata: {str(e)}")
         traceback.print_exc()
         return ""
 
@@ -176,9 +211,9 @@ def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_pre
         job_id = uuid.uuid4().hex[:8]
         # Save image to temp directory and get path
         image_array = np.array(image)
-        image_path = save_image_to_temp(image_array, job_id)
+        image_path = save_image_to_temp(image_array, job_id, prompt, seed)  # Pass prompt and seed
         if not image_path:
-            print("Failed to save image to temp, cannot add job.")
+            print("Failed to save image with metadata to temp, cannot add job.")
             return None
 
         job = QueuedJob(
@@ -317,11 +352,18 @@ def update_job_status(job_id: str, status: str, thumbnail: str = None):
     job_found_in_memory = False
     for job in job_queue:
         if job.job_id == job_id:
-            job.status = status
-            if thumbnail:
+            # Update status and timestamp
+            if job.status != status:  # Only update timestamp if status actually changes
+                job.status = status
+                job.updated_at = datetime.now(timezone.utc)
+                job_updated = True
+            if thumbnail and job.thumbnail != thumbnail:
                 job.thumbnail = thumbnail
-            job_updated = True
-            job_found_in_memory = True
+                job.updated_at = datetime.now(timezone.utc)  # Also update if thumbnail changes
+                job_updated = True  # Mark as updated if thumbnail changed
+
+            if job_updated:
+                job_found_in_memory = True
             break
 
     if job_updated:
@@ -333,11 +375,18 @@ def update_job_status(job_id: str, status: str, thumbnail: str = None):
         job_found_in_file = False
         for job in current_queue:
             if job.job_id == job_id:
-                job.status = status
-                if thumbnail:
+                # Update status and timestamp in file data
+                if job.status != status:
+                    job.status = status
+                    job.updated_at = datetime.now(timezone.utc)
+                    job_found_in_file = True
+                if thumbnail and job.thumbnail != thumbnail:
                     job.thumbnail = thumbnail
-                job_found_in_file = True
-                break
+                    job.updated_at = datetime.now(timezone.utc)
+                    job_found_in_file = True  # Mark as found if thumbnail changed
+
+                if job_found_in_file:
+                    break
 
         if job_found_in_file:
             # Overwrite the file with the updated list
@@ -371,13 +420,26 @@ def update_job_progress(job_id: str, progress: float, step: int, total: int, inf
     job_found_in_memory = False
     for job in job_queue:
         if job.job_id == job_id:
-            job.progress = progress
-            job.progress_step = step
-            job.progress_total = total
-            job.progress_info = info
-            job_updated = True
-            job_found_in_memory = True
-            logging.info(f"Job {job_id} found in memory. Updating progress.")
+            # Update progress fields and timestamp
+            needs_update = False
+            if job.progress != progress:
+                job.progress = progress
+                needs_update = True
+            if job.progress_step != step:
+                job.progress_step = step
+                needs_update = True
+            if job.progress_total != total:
+                job.progress_total = total
+                needs_update = True
+            if job.progress_info != info:
+                job.progress_info = info
+                needs_update = True
+
+            if needs_update:
+                job.updated_at = datetime.now(timezone.utc)
+                job_updated = True
+                job_found_in_memory = True
+                logging.info(f"Job {job_id} found in memory. Updating progress and timestamp.")
             break
 
     if job_updated:
@@ -395,11 +457,25 @@ def update_job_progress(job_id: str, progress: float, step: int, total: int, inf
         for job in current_queue:
             if job.job_id == job_id:
                 logging.info(f"Job {job_id} found in file. Updating progress.")
-                job.progress = progress
-                job.progress_step = step
-                job.progress_total = total
-                job.progress_info = info
-                job_found_in_file = True
+                # Update progress fields and timestamp in file data
+                needs_update = False
+                if job.progress != progress:
+                    job.progress = progress
+                    needs_update = True
+                if job.progress_step != step:
+                    job.progress_step = step
+                    needs_update = True
+                if job.progress_total != total:
+                    job.progress_total = total
+                    needs_update = True
+                if job.progress_info != info:
+                    job.progress_info = info
+                    needs_update = True
+
+                if needs_update:
+                    job.updated_at = datetime.now(timezone.utc)
+                    job_found_in_file = True
+                    logging.info(f"Job {job_id} found in file. Updating progress and timestamp.")
                 break
 
         if job_found_in_file:
@@ -498,10 +574,108 @@ def update_queue_display():
             #     # You might need a placeholder image path or handle this differently in Gradio
             #     placeholder_thumb = "path/to/placeholder.png" # Define a placeholder image
             #     if os.path.exists(placeholder_thumb):
-            #         queue_data.append((placeholder_thumb, caption))
-
-        return queue_data
-    except Exception as e:
+        # End of the try block from line 523
+        return queue_data  # Return data collected in the try block
+    except Exception as e:  # Add except block for the try at line 523
         print(f"Error updating queue display: {str(e)}")
+        # traceback.print_exc()  # Consider removing or using logging for production
+        return []  # Return empty list on error
+
+
+# --- Cleanup Function ---
+
+
+def cleanup_jobs_by_max_count(max_completed_jobs: int = settings.MAX_COMPLETED_JOBS):
+    """
+    Removes old completed, cancelled, or failed jobs if their total count exceeds the limit.
+    Jobs are removed based on their 'updated_at' timestamp (oldest first).
+    Also removes associated temporary files (input image, thumbnail).
+    """
+    global job_queue
+    logging.info(f"Starting job cleanup. Max completed/cancelled/failed jobs to keep: {max_completed_jobs}")
+
+    try:
+        current_queue = load_queue_from_file()
+        # terminal_statuses = {"completed", "cancelled", "failed"} # Unused variable
+
+        # Separate jobs by status
+        active_jobs = []  # pending, processing
+        terminal_jobs = []  # completed, cancelled, failed
+
+        for job in current_queue:
+            # Handle potential variations in 'failed' status (e.g., "failed - Reason")
+            is_terminal = job.status == "completed" or job.status == "cancelled" or job.status.startswith("failed")
+            if is_terminal:
+                terminal_jobs.append(job)
+            else:
+                active_jobs.append(job)
+
+        num_terminal_jobs = len(terminal_jobs)
+        logging.info(f"Found {num_terminal_jobs} terminal jobs (completed/cancelled/failed).")
+
+        if num_terminal_jobs <= max_completed_jobs:
+            logging.info("Number of terminal jobs does not exceed the limit. No cleanup needed.")
+            return 0  # No jobs removed
+
+        # Sort terminal jobs by updated_at timestamp (oldest first)
+        # Handle potential None values for updated_at just in case
+        terminal_jobs.sort(key=lambda j: j.updated_at or datetime.min.replace(tzinfo=timezone.utc))
+
+        # Determine how many jobs to remove
+        num_to_remove = num_terminal_jobs - max_completed_jobs
+        jobs_to_remove = terminal_jobs[:num_to_remove]
+        jobs_to_keep = terminal_jobs[num_to_remove:]
+
+        logging.info(f"Exceeded limit by {num_to_remove} jobs. Preparing to remove oldest ones.")
+
+        removed_count = 0
+        files_to_delete = []
+
+        # Identify files associated with jobs to be removed
+        for job in jobs_to_remove:
+            logging.info(f"Marking job {job.job_id} (status: {job.status}, updated: {job.updated_at}) for removal.")
+            if job.image_path:
+                files_to_delete.append(job.image_path)
+            if job.thumbnail:
+                files_to_delete.append(job.thumbnail)
+            removed_count += 1
+
+        # Combine kept terminal jobs and active jobs for the new queue
+        new_queue_jobs = active_jobs + jobs_to_keep
+
+        # Save the new queue to the file
+        try:
+            jobs_to_save = [j.to_dict() for j in new_queue_jobs if j.to_dict() is not None]
+            file_path = os.path.abspath(QUEUE_FILE)
+            with open(file_path, 'w') as f:
+                json.dump(jobs_to_save, f, indent=2)
+            logging.info(f"Successfully saved updated queue file with {len(new_queue_jobs)} jobs.")
+            # Update the global in-memory queue as well
+            job_queue = new_queue_jobs
+        except Exception as e:
+            logging.error(f"Error saving queue file during cleanup: {e}")
+            traceback.print_exc()
+            # If saving fails, we should not proceed with file deletion
+            return 0
+
+        # Delete associated files *after* successfully saving the queue
+        deleted_files_count = 0
+        for file_path in files_to_delete:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logging.info(f"Deleted temporary file: {file_path}")
+                    deleted_files_count += 1
+                else:
+                    logging.warning(f"Temporary file not found for deletion: {file_path}")
+            except Exception as e:
+                logging.error(f"Error deleting temporary file {file_path}: {e}")
+
+        logging.info(f"Job cleanup finished. Removed {removed_count} job entries and attempted to delete {deleted_files_count} associated files.")
+        return removed_count
+
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during job cleanup: {e}")
         traceback.print_exc()
-        return []
+        return 0
+# Removed erroneous code from previous diff attempts
