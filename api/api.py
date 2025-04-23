@@ -145,7 +145,7 @@ def shutdown_event():
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_video(
     background_tasks: BackgroundTasks,
-    prompt: str = Form("dancing"),  # Set default prompt to "dancing"
+    prompt: str = Form("A character doing some simple body movements."),  # Set default prompt
     video_length: float = Form(5.0),
     seed: int = Form(-1),
     use_teacache: bool = Form(True),  # Default to True (matching demo_gradio.py)
