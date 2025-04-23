@@ -182,4 +182,5 @@ cython_debug/
 quick_prompts.json
 job_queue.json
 temp_queue_images/*
-    
+
+archive/*
