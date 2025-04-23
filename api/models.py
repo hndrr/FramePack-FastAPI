@@ -152,17 +152,37 @@ if __name__ == '__main__':
 # Placeholder function for unloading models and cleaning up resources
 def unload_models(models_dict):
     """
-    Explicitly unloads models and releases resources (e.g., GPU memory).
-    Implement the actual unloading logic here if needed.
+    Explicitly unloads models and releases resources, especially GPU memory.
     """
-    print("Unloading models (placeholder)...")
-    # Example for PyTorch:
-    # for key in list(models_dict.keys()):
-    #     model = models_dict.pop(key)
-    #     del model
-    # import torch
-    # if torch.cuda.is_available():
-    #     torch.cuda.empty_cache()
-    #     print("Cleared CUDA cache.")
-    print("Model unloading placeholder complete.")
-    pass  # Remove pass when implementing actual logic
+    print("Unloading models...")
+    model_keys = ["vae", "text_encoder", "text_encoder_2", "image_encoder", "transformer"]
+    for key in model_keys:
+        if key in models_dict:
+            try:
+                # Directly delete the reference from the dictionary
+                del models_dict[key]
+                print(f"Removed reference to model: {key}")
+            except Exception as e:
+                print(f"Error removing reference to model {key}: {e}")
+
+    # Clear GPU cache if CUDA is available
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            print("Cleared PyTorch CUDA cache.")
+        except Exception as e:
+            print(f"Error clearing CUDA cache: {e}")
+    else:
+        print("CUDA not available, skipping cache clear.")
+
+    # Optionally remove other non-model items if needed
+    other_keys = ["tokenizer", "tokenizer_2", "feature_extractor", "high_vram"]
+    for key in other_keys:
+        if key in models_dict:
+            try:
+                del models_dict[key]  # Remove reference from dict
+                print(f"Removed reference to: {key}")
+            except Exception as e:
+                print(f"Error removing reference to {key}: {e}")
+
+    print("Model unloading complete.")
