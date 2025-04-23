@@ -445,7 +445,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         # Final save
         update_progress("Saving final video...", 98)
         final_filename = os.path.join(outputs_folder, f"{job_id}.mp4")
-        save_bcthw_as_mp4(history_pixels, final_filename, crf=mp4_crf, frame_rate=30)
+        save_bcthw_as_mp4(history_pixels, final_filename, crf=mp4_crf, fps=30)  # Use fps instead of frame_rate
 
         # Update job status to completed
         queue_manager.update_job_status(job_id, "completed")
