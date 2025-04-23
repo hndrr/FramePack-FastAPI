@@ -36,9 +36,9 @@ async def lifespan(app: FastAPI):
     # Load models
     try:
         # Consider running blocking IO in a threadpool executor in async context
-        # e.g., await asyncio.to_thread(models.load_models, lora_path=settings.LORA_PATH)
+        # e.g., await asyncio.to_thread(models.load_models)  # lora_path removed
         # For simplicity now, keeping the direct call but be aware of potential blocking
-        loaded_models = models.load_models(lora_path=settings.LORA_PATH)
+        loaded_models = models.load_models()  # lora_path 引数を削除
         print("Models loaded successfully via lifespan.")
     except Exception as e:
         print(f"FATAL: Failed to load models on startup via lifespan: {e}")
