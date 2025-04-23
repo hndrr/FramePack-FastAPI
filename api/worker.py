@@ -416,7 +416,10 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                 return  # Exit worker function
 
             # Update history
-            history_latents = generated_latents[:, :, -(1 + 2 + 16):, :, :].clone()  # Corrected slicing
+            # Update total generated frames *before* updating history (moved from L446)
+            total_generated_latent_frames += int(generated_latents.shape[2])
+            # Update history by concatenating (like demo_gradio.py L557)
+            history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
             # Decode and append frames
             update_progress(
@@ -429,21 +432,25 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                 unload_complete_models()
                 load_model_as_complete(vae, target_device=gpu)
 
-            pixels = vae_decode(
-                generated_latents[
-                    :, :, latent_padding_size:latent_padding_size + latent_window_size  # Corrected slicing
-                ],
-                vae,
-            )
+            # Use the full history for decoding and appending (like demo_gradio.py L562-571)
+            real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if history_pixels is None:
-                history_pixels = pixels
+                # Decode the entire history for the first section
+                history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
-                history_pixels = soft_append_bcthw(
-                    history_pixels, pixels, soft_length=4
-                )
+                # Calculate frames for current section and overlap
+                # Note: demo_gradio.py L567 seems to have a potential off-by-one or logic mismatch
+                # compared to L553/L555. Using the logic from demo_gradio.py L567 & L570 for now.
+                section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+                overlapped_frames = latent_window_size * 4 - 3  # Same calculation as demo_gradio.py L568
 
-            total_generated_latent_frames += latent_window_size
+                # Decode only the relevant part of the history for the current section
+                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                # Append using the calculated overlap (like demo_gradio.py L571)
+                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+
+            # total_generated_latent_frames update moved before history_latents update (see L419 block)
 
             # Save intermediate result (optional)
             # intermediate_filename = os.path.join(outputs_folder, f'{job_id}_part_{current_sampling_step}.mp4')
