@@ -1,4 +1,4 @@
-# FramePack (with FastAPI API Fork)
+# [WIP] FramePack (with FastAPI API Fork)
 
 **Note:** This is a fork of the original [FramePack](https://github.com/lllyasviel/FramePack) project, adding a FastAPI-based API for video generation. The original README content follows below.
 
