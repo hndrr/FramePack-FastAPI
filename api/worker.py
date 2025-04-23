@@ -108,9 +108,9 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         except Exception as e:
             print(f"Error updating job progress for {job_id}: {e}")
             # Decide if this error should halt the process or just be logged
-    
+
     update_progress("Starting ...", 0, 0, steps)  # Initial progress
-    
+
     try:
         # Load input image
         try:
@@ -348,10 +348,10 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                 section_progress_fraction = current_cb_step / total_cb_steps
                 overall_sampling_progress = section_progress_fraction * (70 / sampling_step_count)
                 overall_percentage = section_progress_start + overall_sampling_progress
-        
+
                 hint = f'Sampling section {current_sampling_step}/{sampling_step_count} - Step {current_cb_step}/{total_cb_steps}'
                 print(f"Job {job_id} Progress: {hint} ({overall_percentage:.1f}%)")
-        
+
                 # Update progress via queue_manager
                 update_job_progress(
                     job_id=job_id,
@@ -360,7 +360,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                     total=total_cb_steps,
                     info=hint
                 )
-        
+
                 # Check for cancellation signal within callback
                 current_job_status_inner = queue_manager.get_job_by_id(job_id)  # Use the function that reads the file
                 if current_job_status_inner and current_job_status_inner.status == "cancelled":
@@ -458,7 +458,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         update_progress("Finished", 100, steps, steps)  # Mark 100% progress
         queue_manager.update_job_status(job_id, "completed")
         print(f"Job {job_id} completed successfully. Output: {final_filename}")
-    
+
     except Exception as e:
         print(f"Error processing job {job_id}: {str(e)}")
         traceback.print_exc()
@@ -471,7 +471,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         update_job_progress(job_id, last_perc, last_step, last_total, fail_info)
         queue_manager.update_job_status(job_id, f"failed - {type(e).__name__}")
         print(f"Job {job_id} failed: {fail_info}")
-    
+
     finally:
         # Final GPU cleanup (optional, depends on worker lifecycle)
         if not high_vram:
