@@ -2,7 +2,8 @@ import io
 import os
 import time
 import threading
-import traceback  # Added for exception printing
+import traceback
+from contextlib import asynccontextmanager  # Import from standard library
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -16,9 +17,6 @@ from . import models
 from . import queue_manager
 from . import worker
 
-# --- FastAPI App Initialization ---
-app = FastAPI(title="FramePack I2V API", version="0.1.0")
-
 # --- Global State ---
 # Dictionary to hold loaded models
 loaded_models = {}
@@ -28,9 +26,67 @@ worker_thread = None
 # Variable to store the ID of the currently processing job
 currently_processing_job_id: str | None = None
 
+
+# --- Lifespan Context Manager ---
+@asynccontextmanager  # Use the imported decorator directly
+async def lifespan(app: FastAPI):
+    # Startup logic
+    global loaded_models, worker_running, worker_thread
+    print("API starting up via lifespan...")
+    # Load models
+    try:
+        # Consider running blocking IO in a threadpool executor in async context
+        # e.g., await asyncio.to_thread(models.load_models, lora_path=settings.LORA_PATH)
+        # For simplicity now, keeping the direct call but be aware of potential blocking
+        loaded_models = models.load_models(lora_path=settings.LORA_PATH)
+        print("Models loaded successfully via lifespan.")
+    except Exception as e:
+        print(f"FATAL: Failed to load models on startup via lifespan: {e}")
+        traceback.print_exc()
+        loaded_models = {}
+
+    # Start background worker
+    if not worker_running:
+        worker_running = True
+        # Note: Starting/managing threads directly in async code needs care.
+        worker_thread = threading.Thread(target=background_worker_task, daemon=True)
+        worker_thread.start()
+        print("Background worker thread started via lifespan.")
+    else:
+        print("Worker already running? Skipping start in lifespan.")
+
+    yield
+
+    # Shutdown logic
+    print("API shutting down via lifespan...")
+    # Stop background worker
+    if worker_running:
+        worker_running = False
+        if worker_thread:
+            print("Waiting for worker thread to finish via lifespan...")
+            # Note: thread.join() is blocking. Consider alternatives in async context.
+            worker_thread.join(timeout=settings.WORKER_CHECK_INTERVAL + 5)
+            if worker_thread.is_alive():
+                print("Warning: Worker thread did not stop gracefully via lifespan.")
+            else:
+                print("Worker thread stopped via lifespan.")
+    # Cleanup resources
+    print("Attempting to unload models...")
+    try:
+        models.unload_models(loaded_models)  # Call the function from models module
+        print("Models unloaded successfully (or placeholder executed).")
+    except Exception as unload_e:
+        print(f"Error during model unloading: {unload_e}")
+        traceback.print_exc()
+    print("Shutdown complete via lifespan.")
+
+
+# --- FastAPI App Initialization ---
+# Use the lifespan context manager
+app = FastAPI(title="FramePack I2V API", version="0.1.0", lifespan=lifespan)
+
+
 # --- Pydantic Models for API Requests/Responses ---
-
-
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., description="Text prompt for video generation.")
     # image: str = Field(..., description="Base64 encoded input image.")  # Changed to use UploadFile
@@ -96,51 +152,8 @@ def background_worker_task():
             time.sleep(settings.WORKER_CHECK_INTERVAL)
     print("Background worker stopped.")
 
-# --- FastAPI Events ---
-
-
-@app.on_event("startup")
-async def startup_event():
-    global loaded_models, worker_running, worker_thread
-    print("API starting up...")
-    # Load models
-    try:
-        loaded_models = models.load_models(lora_path=settings.LORA_PATH)
-        print("Models loaded successfully.")
-    except Exception as e:
-        print(f"FATAL: Failed to load models on startup: {e}")
-        # Depending on requirements, you might want to prevent startup
-        # raise RuntimeError(f"Failed to load models: {e}") from e
-        loaded_models = {}  # Ensure it's empty if loading failed
-
-    # Start background worker
-    if not worker_running:
-        worker_running = True
-        worker_thread = threading.Thread(target=background_worker_task, daemon=True)
-        worker_thread.start()
-        print("Background worker thread started.")
-
-
-@app.on_event("shutdown")
-def shutdown_event():
-    global worker_running, worker_thread
-    print("API shutting down...")
-    # Stop background worker
-    if worker_running:
-        worker_running = False
-        if worker_thread:
-            print("Waiting for worker thread to finish...")
-            worker_thread.join(timeout=settings.WORKER_CHECK_INTERVAL + 5)  # Wait a bit longer than check interval
-            if worker_thread.is_alive():
-                print("Warning: Worker thread did not stop gracefully.")
-            else:
-                print("Worker thread stopped.")
-    # Cleanup resources if needed (e.g., explicitly delete models from GPU)
-    # unload_models()  # Implement if necessary
-    print("Shutdown complete.")
-
-
 # --- API Endpoints ---
+
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_video(
