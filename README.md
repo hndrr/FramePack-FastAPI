@@ -32,18 +32,18 @@ pip install -r requirements.txt
 To run the API server, execute the following command from the project root directory (ensure your virtual environment is activated):
 
 ```bash
-uvicorn api.api:app --host 0.0.0.0 --port 8000 --reload
+uvicorn api.api:app --host 0.0.0.0 --port 8080 --reload
 ```
 
 * `--host 0.0.0.0`: Allows access from other devices on the local network.
-* `--port 8000`: Specifies the port (can be changed in `api/settings.py`).
+* `--port 8080`: Specifies the port (can be changed in `api/settings.py`).
 * `--reload`: Automatically restarts the server when code changes (for development).
 
 ### Accessing the API Documentation
 
 Once the server is running, you can access the interactive API documentation (Swagger UI) in your browser at:
 
-[http://localhost:8000/docs](http://localhost:8000/docs)
+[http://localhost:8000/docs](http://localhost:8080/docs)
 
 From there, you can test the available API endpoints (`/generate`, `/status/{job_id}`, `/result/{job_id}`, `/queue`).
 
