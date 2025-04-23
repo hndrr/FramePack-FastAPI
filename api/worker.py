@@ -38,6 +38,7 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 
 # Assuming queue_manager is available for status updates (relative import)
 from . import queue_manager
+from .queue_manager import update_job_progress  # Import the specific function
 from . import settings  # Import settings to get OUTPUTS_DIR
 
 # Define output folder using settings
@@ -91,15 +92,25 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     tokenizer_2 = models["tokenizer_2"]
     feature_extractor = models["feature_extractor"]
 
-    # Placeholder for progress update function (replaces stream.output_queue.push)
-    def update_progress(step_info: str, percentage: float = 0.0):
+    # Progress update function that calls queue_manager
+    def update_progress(step_info: str, percentage: float = 0.0, current_step: int = 0, total_steps: int = 0):
+        """Updates progress in the console and via queue_manager."""
         print(f"Job {job_id} Progress: {step_info} ({percentage:.1f}%)")
-        # Here you could potentially update the job status with more detail
-        # queue_manager.update_job_status(job_id, f"processing - {step_info}", ...)
-        pass  # Replace with actual progress reporting if needed
-
-    update_progress("Starting ...", 0)
-
+        try:
+            # Use the new function to update progress details in the queue manager
+            update_job_progress(
+                job_id=job_id,
+                progress=percentage,
+                step=current_step,
+                total=total_steps if total_steps > 0 else steps,  # Use overall steps if section total is 0
+                info=step_info
+            )
+        except Exception as e:
+            print(f"Error updating job progress for {job_id}: {e}")
+            # Decide if this error should halt the process or just be logged
+    
+    update_progress("Starting ...", 0, 0, steps)  # Initial progress
+    
     try:
         # Load input image
         try:
@@ -118,13 +129,13 @@ def worker(job: queue_manager.QueuedJob, models: dict):
 
         # Clean GPU if not high_vram
         if not high_vram:
-            update_progress("Cleaning GPU memory...", 0)
+            update_progress("Cleaning GPU memory...", 1, 0, steps)  # Small progress increment
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
 
         # Text encoding
-        update_progress("Text encoding ...", 5)
+        update_progress("Text encoding ...", 5, 0, steps)
         if not high_vram:
             fake_diffusers_current_device(text_encoder, gpu)
             load_model_as_complete(text_encoder_2, target_device=gpu)
@@ -189,7 +200,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         )
 
         # Processing input image
-        update_progress("Image processing ...", 10)
+        update_progress("Image processing ...", 10, 0, steps)
         input_image = np.squeeze(input_image)  # Ensure 3D
         if input_image.ndim != 3 or input_image.shape[2] != 3:
             print(f"Error: Invalid image shape {input_image.shape} for job {job_id}")
@@ -217,14 +228,14 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
         # VAE encoding
-        update_progress("VAE encoding ...", 15)
+        update_progress("VAE encoding ...", 15, 0, steps)
         if not high_vram:
             load_model_as_complete(vae, target_device=gpu)
 
         start_latent = vae_encode(input_image_pt, vae)
 
         # CLIP Vision encoding
-        update_progress("CLIP Vision encoding ...", 20)
+        update_progress("CLIP Vision encoding ...", 20, 0, steps)
         if not high_vram:
             load_model_as_complete(image_encoder, target_device=gpu)
 
@@ -243,7 +254,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         )
 
         # Sampling
-        update_progress("Start sampling ...", 25)
+        update_progress("Start sampling ...", 25, 0, steps)
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
@@ -271,11 +282,10 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                 70 / sampling_step_count
             )
 
-            # Check for cancellation signal (e.g., if job status is set to 'cancelled')
-            current_job_status = queue_manager.get_job_by_id(job_id)  # Use the function that reads the file
-            if current_job_status and current_job_status.status == "cancelled":
-                print(f"Job {job_id} cancelled during sampling.")
-                # No need to update status again, it's already 'cancelled'
+            # Check for cancellation signal at the beginning of each section
+            current_job_status_section_start = queue_manager.get_job_by_id(job_id)
+            if current_job_status_section_start and current_job_status_section_start.status == "cancelled":
+                print(f"Job {job_id} cancellation detected at start of section {current_sampling_step}.")
                 return
 
             is_last_section = latent_padding == 0
@@ -284,9 +294,12 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             print(
                 f"Job {job_id}: latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}"
             )
+            # Update progress for the start of the section
             update_progress(
                 f"Sampling section {current_sampling_step}/{sampling_step_count}",
                 section_progress_start,
+                0,  # Step count resets for the section's callback
+                steps  # Total steps for this section remains the overall steps parameter
             )
 
             indices = torch.arange(
@@ -325,18 +338,34 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             else:
                 transformer.initialize_teacache(enable_teacache=False)
 
-            # K-Diffusion Sampling Callback (Simplified for API, console output only)
+            # K-Diffusion Sampling Callback
             def callback(d):
-                step = d['i']
-                # total = d['total']  # 'total' key is not provided by the sampler callback
-                percentage = int(100.0 * (step + 1) / steps)  # Use 'steps' variable directly
-                hint = f'Sampling section {current_sampling_step}/{sampling_step_count} - Step {step+1}/{steps}'  # Use 'steps' variable directly
-                print(f"Job {job_id} Progress: {hint} ({percentage}%)")  # Simple console log
+                current_cb_step = d['i'] + 1  # 1-based step for the current section
+                total_cb_steps = steps  # Total steps for this section
 
+                # Calculate overall progress percentage
+                # Sampling spans from 25% to 95% (70% total)
+                section_progress_fraction = current_cb_step / total_cb_steps
+                overall_sampling_progress = section_progress_fraction * (70 / sampling_step_count)
+                overall_percentage = section_progress_start + overall_sampling_progress
+        
+                hint = f'Sampling section {current_sampling_step}/{sampling_step_count} - Step {current_cb_step}/{total_cb_steps}'
+                print(f"Job {job_id} Progress: {hint} ({overall_percentage:.1f}%)")
+        
+                # Update progress via queue_manager
+                update_job_progress(
+                    job_id=job_id,
+                    progress=overall_percentage,
+                    step=current_cb_step,
+                    total=total_cb_steps,
+                    info=hint
+                )
+        
                 # Check for cancellation signal within callback
                 current_job_status_inner = queue_manager.get_job_by_id(job_id)  # Use the function that reads the file
                 if current_job_status_inner and current_job_status_inner.status == "cancelled":
-                    print(f"Job {job_id} cancelled during sampling step {step+1}.")
+                    # Use current_cb_step which is defined in this scope
+                    print(f"Job {job_id} cancelled during sampling step {current_cb_step}.")
                     raise InterruptedError(
                         "Job cancelled"
                     )  # Raise exception to stop sampling
@@ -392,7 +421,9 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             # Decode and append frames
             update_progress(
                 f"VAE decoding section {current_sampling_step}/{sampling_step_count}",
-                section_progress_end - 1,
+                section_progress_end - 1,  # Approximate percentage
+                0,  # Reset step count for this phase
+                steps  # Use overall steps as total for this phase marker
             )
             if not high_vram:
                 unload_complete_models()
@@ -419,21 +450,28 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             # save_bcthw_as_mp4(history_pixels, intermediate_filename, crf=mp4_crf, frame_rate=30)
 
         # Final save
-        update_progress("Saving final video...", 98)
+        update_progress("Saving final video...", 98, 0, steps)
         final_filename = os.path.join(outputs_folder, f"{job_id}.mp4")
         save_bcthw_as_mp4(history_pixels, final_filename, crf=mp4_crf, fps=30)  # Use fps instead of frame_rate
 
-        # Update job status to completed
+        # Update job status and final progress
+        update_progress("Finished", 100, steps, steps)  # Mark 100% progress
         queue_manager.update_job_status(job_id, "completed")
-        update_progress("Finished", 100)
         print(f"Job {job_id} completed successfully. Output: {final_filename}")
-
+    
     except Exception as e:
         print(f"Error processing job {job_id}: {str(e)}")
         traceback.print_exc()
+        # Update status to failed, keep last known progress but update status and info.
+        last_progress = queue_manager.get_job_by_id(job_id)  # Get current state before updating status
+        last_perc = last_progress.progress if last_progress else 0
+        last_step = last_progress.progress_step if last_progress else 0
+        last_total = last_progress.progress_total if last_progress else steps
+        fail_info = f"Failed: {type(e).__name__}"
+        update_job_progress(job_id, last_perc, last_step, last_total, fail_info)
         queue_manager.update_job_status(job_id, f"failed - {type(e).__name__}")
-        update_progress(f"Failed: {type(e).__name__}", 100)
-
+        print(f"Job {job_id} failed: {fail_info}")
+    
     finally:
         # Final GPU cleanup (optional, depends on worker lifecycle)
         if not high_vram:

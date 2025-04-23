@@ -17,3 +17,7 @@ peft
 
 fastapi
 uvicorn[standard]
+
+# Testing
+pytest
+pytest-mock

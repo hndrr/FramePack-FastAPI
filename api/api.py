@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
-from typing import List
+from typing import List, Optional  # Import Optional
 
 # Import modules created earlier (relative imports)
 from . import settings
@@ -110,11 +110,19 @@ class GenerateResponse(BaseModel):
 class JobStatusResponse(BaseModel):
     job_id: str
     status: str
-    # Add more fields if needed, e.g., progress percentage, estimated time
+    progress: Optional[float] = None
+    progress_step: Optional[int] = None
+    progress_total: Optional[int] = None
+    progress_info: Optional[str] = None
 
 
 class QueueStatusResponse(BaseModel):
     queue: List[dict]  # List of job summaries
+
+
+class WorkerStatusResponse(BaseModel):
+    is_running: bool
+    processing_job_id: Optional[str] = None
 
 
 # --- Background Worker ---
@@ -226,20 +234,46 @@ async def get_job_status(job_id: str):
     """Checks the status of a job."""
     global currently_processing_job_id
 
-    # 1. Check if it's the currently processing job
+    # 1. Check if it's the currently processing job (and get its progress)
     if job_id == currently_processing_job_id:
-        return JobStatusResponse(job_id=job_id, status="processing")
+        # Even if processing, get the latest progress details from the queue manager
+        job_details = queue_manager.get_job_by_id(job_id)
+        if job_details:
+            return JobStatusResponse(
+                job_id=job_id,
+                status="processing",
+                progress=getattr(job_details, 'progress', None),
+                progress_step=getattr(job_details, 'progress_step', None),
+                progress_total=getattr(job_details, 'progress_total', None),
+                progress_info=getattr(job_details, 'progress_info', None)
+            )
+        else:
+            # Should ideally not happen if it's the current job, but handle gracefully
+            return JobStatusResponse(job_id=job_id, status="processing", progress_info="Details temporarily unavailable")
 
-    # 2. Check if the job exists in the queue file (pending)
-    job_in_file = queue_manager.get_job_by_id(job_id)  # Use the renamed function that reads file
+    # 2. Check if the job exists in the queue file (pending, failed, potentially completed but file not checked yet)
+    job_in_file = queue_manager.get_job_by_id(job_id)  # Use the function that reads file
     if job_in_file:
-        # Return the status from the file (usually 'pending' if not processing)
-        return JobStatusResponse(job_id=job_id, status=job_in_file.status)
+        # Return the status and progress details from the file
+        return JobStatusResponse(
+            job_id=job_id,
+            status=job_in_file.status,
+            progress=getattr(job_in_file, 'progress', None),
+            progress_step=getattr(job_in_file, 'progress_step', None),
+            progress_total=getattr(job_in_file, 'progress_total', None),
+            progress_info=getattr(job_in_file, 'progress_info', None)
+        )
 
-    # 3. Check if the output file exists (completed)
+    # 3. Check if the output file exists (implies completed)
     output_file = os.path.join(settings.OUTPUTS_DIR, f"{job_id}.mp4")
     if os.path.exists(output_file):
-        return JobStatusResponse(job_id=job_id, status="completed")
+        # If file exists, assume completed with 100% progress
+        return JobStatusResponse(
+            job_id=job_id,
+            status="completed",
+            progress=100.0,
+            progress_info="Completed"
+        )
 
     # 4. If none of the above, the job is not found
     raise HTTPException(status_code=404, detail="Job not found")
@@ -268,6 +302,53 @@ async def get_queue_info():
     # Implementation needed: Get queue status from queue_manager
     queue_status = queue_manager.get_queue_status()
     return QueueStatusResponse(queue=queue_status)
+
+
+@app.get("/worker/status", response_model=WorkerStatusResponse)
+async def get_worker_status():
+    """Returns the current status of the background worker."""
+    global worker_running, currently_processing_job_id
+    return WorkerStatusResponse(
+        is_running=worker_running,
+        processing_job_id=currently_processing_job_id
+    )
+
+
+@app.post("/cancel/{job_id}", status_code=200)
+async def cancel_job(job_id: str):
+    """Requests cancellation of a job."""
+    # Check if the job exists (optional but good practice)
+    job = queue_manager.get_job_by_id(job_id)
+    output_file = os.path.join(settings.OUTPUTS_DIR, f"{job_id}.mp4")
+
+    if not job and not os.path.exists(output_file):
+        # If job not in queue and output doesn't exist, it's likely invalid
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job and job.status == "completed":
+        return {"message": "Job is already completed."}
+    if not job and os.path.exists(output_file):
+        return {"message": "Job is already completed (output file exists)."}
+
+    # Update the job status to cancelled
+    updated = queue_manager.update_job_status(job_id, "cancelled")
+
+    if updated:
+        print(f"Cancellation requested for job {job_id}")
+        return {"message": f"Cancellation requested for job {job_id}."}
+    else:
+        # This might happen if the job completed between the check and the update,
+        # or if get_job_by_id failed unexpectedly after the initial check.
+        # Re-check status to provide a more accurate response.
+        final_check_job = queue_manager.get_job_by_id(job_id)
+        if final_check_job and final_check_job.status == "completed":
+            return {"message": "Job completed before cancellation could be fully processed."}
+        elif not final_check_job and os.path.exists(output_file):
+            return {"message": "Job completed before cancellation could be fully processed (output file exists)."}
+        else:
+            # If still not found or status isn't completed, raise internal error
+            print(f"Failed to update status to cancelled for job {job_id}, job might not exist anymore.")
+            raise HTTPException(status_code=500, detail="Failed to request job cancellation. Job might have finished or encountered an issue.")
 
 
 # --- Main execution (for running with uvicorn) ---
