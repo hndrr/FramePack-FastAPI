@@ -185,3 +185,6 @@ temp_queue_images/*
 
 archive/*
 job_queue.json
+main.obj
+main.exp
+main.lib
