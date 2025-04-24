@@ -5,9 +5,11 @@ import threading
 import traceback
 import asyncio
 import json
+import base64  # 追加: Base64エンコード用
+import mimetypes  # 追加: MIMEタイプ判定用
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request  # Request を追加
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse  # JSONResponse を削除
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from PIL import Image
@@ -140,6 +142,11 @@ class WorkerStatusResponse(BaseModel):
 
 class LoraListResponse(BaseModel):
     loras: List[str]
+
+
+class ResultResponse(BaseModel):
+    video_url: str
+    thumbnail_base64: Optional[str] = None  # サムネイルは存在しない場合もあるためOptional
 
 
 # --- Background Worker ---
@@ -353,7 +360,7 @@ async def stream_job_status(job_id: str, request: Request):
                 # Send final status event if it hasn't been sent already
                 if current_data_json != last_data_sent:
                     yield f"event: progress\ndata: {current_data_json}\n\n"
-                    last_data_sent = current_data_json # Ensure last_data_sent is updated even for the final message
+                    last_data_sent = current_data_json  # Ensure last_data_sent is updated even for the final message
                     print(f"Sent final progress update for job {job_id}: Status {job.status}")
 
                 # Send a dedicated 'status' event to signal completion/failure/cancellation
@@ -377,22 +384,65 @@ async def stream_job_status(job_id: str, request: Request):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@app.get("/result/{job_id}")
-async def get_job_result(job_id: str):
-    # Implementation needed: Check job status, return video file if completed
+@app.get("/result/{job_id}", response_model=ResultResponse)
+async def get_job_result(job_id: str, request: Request):  # requestを追加してURLを構築
+    """
+    Returns the download URL for the completed video and the Base64 encoded thumbnail.
+    """
     job = queue_manager.get_job_by_id(job_id)
     output_file = os.path.join(settings.OUTPUTS_DIR, f"{job_id}.mp4")
+    is_completed = (job and job.status == "completed") or (not job and os.path.exists(output_file))
 
-    if job and job.status == "completed" and os.path.exists(output_file):
+    if not is_completed:
+        if job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' is not completed yet (status: {job.status}).")
+        else:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found or result file does not exist.")
+
+    # --- サムネイル処理 ---
+    thumbnail_base64 = None
+    if job and job.thumbnail and os.path.exists(job.thumbnail):
+        try:
+            with open(job.thumbnail, "rb") as f:
+                thumbnail_data = f.read()
+            thumbnail_base64_data = base64.b64encode(thumbnail_data).decode("utf-8")
+            # MIMEタイプを推測 (例: image/jpeg)
+            mime_type, _ = mimetypes.guess_type(job.thumbnail)
+            if mime_type:
+                thumbnail_base64 = f"data:{mime_type};base64,{thumbnail_base64_data}"
+            else:
+                # MIMEタイプが不明な場合はデフォルトを使用（またはエラー処理）
+                thumbnail_base64 = f"data:image/jpeg;base64,{thumbnail_base64_data}"  # デフォルトをJPEGに
+            print(f"Job {job_id}: Encoded thumbnail from {job.thumbnail}")
+        except Exception as e:
+            print(f"Job {job_id}: Error reading or encoding thumbnail {job.thumbnail}: {e}")
+            # サムネイルの読み込み/エンコードに失敗してもエラーにはしない
+
+    # --- 動画URL構築 ---
+    # request.url を使用して絶対URLまたは相対URLを構築
+    video_url = str(request.url_for('download_video', job_id=job_id))
+
+    return ResultResponse(
+        video_url=video_url,
+        thumbnail_base64=thumbnail_base64
+    )
+
+
+# --- Download Endpoints ---
+
+@app.get("/download/video/{job_id}")
+async def download_video(job_id: str):
+    """Downloads the generated video file."""
+    output_file = os.path.join(settings.OUTPUTS_DIR, f"{job_id}.mp4")
+    if os.path.exists(output_file):
         return FileResponse(output_file, media_type="video/mp4", filename=f"{job_id}.mp4")
-    elif not job and os.path.exists(output_file):
-        # If job not in queue but file exists, assume completed
-        print(f"Job {job_id} not in queue, but result file found. Serving file.")
-        return FileResponse(output_file, media_type="video/mp4", filename=f"{job_id}.mp4")
-    elif job:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' is not completed yet (status: {job.status}).")
     else:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found or result file does not exist.")
+        # Optionally check job status again here if needed
+        job = queue_manager.get_job_by_id(job_id)
+        if job:
+            raise HTTPException(status_code=404, detail=f"Video file for job '{job_id}' not found, status is '{job.status}'.")
+        else:
+            raise HTTPException(status_code=404, detail=f"Video file for job '{job_id}' not found.")
 
 
 @app.get("/input_image/{job_id}")

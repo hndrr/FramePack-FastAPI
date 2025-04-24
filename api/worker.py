@@ -85,8 +85,11 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     lora_path = job.lora_path
     original_exif = job.original_exif  # Get Exif data from job object
 
-    # Update job status to processing
-    queue_manager.update_job_status(job_id, "processing")
+    thumbnail_path = None  # Initialize thumbnail_path
+
+    # Update job status to processing, including the thumbnail path (will be updated again if thumbnail generated)
+    # We update here initially in case thumbnail generation fails later
+    queue_manager.update_job_status(job_id, "processing", thumbnail=thumbnail_path)
 
     # Load models from the dictionary
     vae = models["vae"]
@@ -120,9 +123,28 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     try:
         # Load input image
         try:
-            pil_input_image = Image.open(input_image_path)
-            # logging.info(f"[Job {job_id}] Exif in input_image after open: {pil_input_image.info.get('exif') is not None}") # DEBUG: Removed
-            input_image = np.array(pil_input_image)
+            pil_input_image = Image.open(input_image_path)  # Keep this line to load the image
+            # logging.info(f"[Job {job_id}] Exif in input_image after open: {pil_input_image.info.get('exif') is not None}")  # DEBUG: Removed
+
+            # --- Thumbnail Generation (Moved Here) ---
+            try:
+                # Generate thumbnail from the loaded input image (pil_input_image)
+                thumb_size = (128, 128)  # Define thumbnail size (adjust as needed)
+                thumb_img = pil_input_image.copy()
+                thumb_img.thumbnail(thumb_size, Image.Resampling.LANCZOS)
+                thumbnail_filename = f"thumb_{job_id}.jpg"
+                # Use previously initialized thumbnail_path variable
+                thumbnail_path = os.path.join(settings.TEMP_QUEUE_IMAGES_DIR, thumbnail_filename)
+                thumb_img.save(thumbnail_path, "JPEG", quality=85)  # Save as JPEG
+                print(f"Job {job_id}: Thumbnail saved to {thumbnail_path}")
+                # Update job status again with the actual thumbnail path
+                queue_manager.update_job_status(job_id, "processing", thumbnail=thumbnail_path)
+            except Exception as thumb_e:
+                print(f"Job {job_id}: Warning - Failed to generate thumbnail: {thumb_e}")
+                thumbnail_path = None  # Ensure path is None if generation fails (already set initially)
+
+            # input_image = np.array(pil_input_image) # Moved numpy conversion later
+
         except FileNotFoundError:
             print(f"Error: Input image not found at {input_image_path}")
             queue_manager.update_job_status(job_id, "failed - image not found")
@@ -130,7 +152,8 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         except Exception as e:
             print(f"Error loading image {input_image_path}: {e}")
             queue_manager.update_job_status(job_id, f"failed - image load error: {e}")
-            return  # Added return here
+            return
+
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -238,7 +261,8 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             print(f"Job {job_id}: No LoRA path specified, skipping LoRA loading.")
         # --- End LoRA Loading ---
 
-        # Processing input image
+        # Processing input image (Convert to numpy array here if needed for processing)
+        input_image = np.array(pil_input_image)  # Convert PIL image to numpy array now
         update_progress("Image processing ...", 12, 0, steps)  # Progress update (percentage adjusted)
         input_image = np.squeeze(input_image)  # Ensure 3D
         if input_image.ndim != 3 or input_image.shape[2] != 3:
