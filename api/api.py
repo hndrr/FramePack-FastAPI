@@ -3,13 +3,15 @@ import os
 import time
 import threading
 import traceback
-from contextlib import asynccontextmanager  # Import from standard library
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
-from fastapi.responses import FileResponse
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request  # Request を追加
+from fastapi.responses import FileResponse, StreamingResponse  # StreamingResponse を追加
 from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
-from typing import List, Optional  # Import Optional
+from typing import List, Optional  # Import Optional (Dict removed as unused)
 
 # Import modules created earlier (relative imports)
 from . import settings
@@ -36,9 +38,9 @@ async def lifespan(app: FastAPI):
     # Load models
     try:
         # Consider running blocking IO in a threadpool executor in async context
-        # e.g., await asyncio.to_thread(models.load_models, lora_path=settings.LORA_PATH)
+        # e.g., await asyncio.to_thread(models.load_models)  # lora_path removed
         # For simplicity now, keeping the direct call but be aware of potential blocking
-        loaded_models = models.load_models(lora_path=settings.LORA_PATH)
+        loaded_models = models.load_models()  # lora_path 引数を削除
         print("Models loaded successfully via lifespan.")
     except Exception as e:
         print(f"FATAL: Failed to load models on startup via lifespan: {e}")
@@ -125,6 +127,10 @@ class WorkerStatusResponse(BaseModel):
     processing_job_id: Optional[str] = None
 
 
+class LoraListResponse(BaseModel):
+    loras: List[str]
+
+
 # --- Background Worker ---
 def background_worker_task():
     global worker_running, currently_processing_job_id
@@ -162,6 +168,8 @@ def background_worker_task():
 
 # --- API Endpoints ---
 
+# === Job Execution Flow ===
+
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_video(
@@ -176,6 +184,8 @@ async def generate_video(
     gs: float = Form(10.0),
     rs: float = Form(0.0),
     mp4_crf: float = Form(16.0),
+    lora_scale: float = Form(1.0),  # 追加: LoRA強度パラメータ
+    lora_path: Optional[str] = Form(None, description="Path to the LoRA file to use for this request (overrides server default if provided)."),  # 追加: LoRAファイルパス
     image: UploadFile = File(...)
 ):
     """
@@ -189,9 +199,13 @@ async def generate_video(
     try:
         contents = await image.read()
         pil_image = Image.open(io.BytesIO(contents))
+        # Extract Exif data BEFORE converting to RGB or NumPy array
+        original_exif = pil_image.info.get('exif')
         # Convert to RGB if necessary (e.g., if PNG has alpha)
         if pil_image.mode == 'RGBA':
+            # Ensure Exif is preserved during conversion if possible (though convert might strip it)
             pil_image = pil_image.convert('RGB')
+            # Re-check exif after convert? Might be lost.
         image_np = np.array(pil_image)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to read or process uploaded image: {e}")
@@ -202,7 +216,8 @@ async def generate_video(
     try:
         job_id = queue_manager.add_to_queue(
             prompt=prompt,
-            image=image_np,  # Pass the numpy array
+            image=image_np,
+            original_exif=original_exif,  # Pass extracted Exif data
             video_length=video_length,
             seed=seed,
             use_teacache=use_teacache,
@@ -212,6 +227,8 @@ async def generate_video(
             gs=gs,
             rs=rs,
             mp4_crf=mp4_crf,
+            lora_scale=lora_scale,  # 追加: lora_scale を渡す
+            lora_path=lora_path,    # 追加: lora_path を渡す
             status="pending"  # Explicitly set initial status
         )
     except Exception as e:
@@ -225,8 +242,6 @@ async def generate_video(
 
     print(f"Job added to queue with ID: {job_id}")
     return GenerateResponse(job_id=job_id, message="Video generation job added to queue.")
-
-# --- Placeholder Endpoints (to be implemented next) ---
 
 
 @app.get("/status/{job_id}", response_model=JobStatusResponse)
@@ -279,6 +294,63 @@ async def get_job_status(job_id: str):
     raise HTTPException(status_code=404, detail="Job not found")
 
 
+@app.get("/stream/status/{job_id}")
+async def stream_job_status(job_id: str, request: Request):
+    """
+    Streams the status and progress of a job using Server-Sent Events (SSE).
+    """
+    async def event_generator():
+        last_data_sent = None
+        # terminal_statuses = {"completed", "cancelled"} # Unused variable removed
+
+        while True:
+            # Check if client disconnected
+            if await request.is_disconnected():
+                print(f"Client disconnected from job {job_id} stream.")
+                break
+
+            job = queue_manager.get_job_by_id(job_id)
+
+            if not job:
+                # Handle case where job might be cleaned up or never existed
+                # Send a final message and close
+                error_data = json.dumps({"status": "error", "message": "Job not found or cleaned up."})
+                yield f"event: status\ndata: {error_data}\n\n"
+                print(f"Job {job_id} not found for streaming, closing connection.")
+                break
+
+            # Prepare data payload
+            current_data = {
+                "job_id": job.job_id,
+                "status": job.status,
+                "progress": getattr(job, 'progress', 0.0),
+                "progress_step": getattr(job, 'progress_step', 0),
+                "progress_total": getattr(job, 'progress_total', 0),
+                "progress_info": getattr(job, 'progress_info', '')
+            }
+            current_data_json = json.dumps(current_data)
+
+            # Send data only if it has changed since last time
+            if current_data_json != last_data_sent:
+                yield f"event: progress\ndata: {current_data_json}\n\n"
+                last_data_sent = current_data_json
+                print(f"Sent progress update for job {job_id}: Status {job.status}, Progress {current_data['progress']:.1f}%")
+
+            # Check for terminal status (completed, cancelled, failed)
+            is_terminal = job.status == "completed" or job.status == "cancelled" or job.status.startswith("failed")
+            if is_terminal:
+                # Send final status event
+                final_data = json.dumps({"status": job.status, "message": "Job finished."})
+                yield f"event: status\ndata: {final_data}\n\n"
+                print(f"Job {job_id} reached terminal state: {job.status}. Closing stream.")
+                break  # Exit loop after sending final status
+
+            # Wait before checking again
+            await asyncio.sleep(1)  # Check every 1 second
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @app.get("/result/{job_id}")
 async def get_job_result(job_id: str):
     # Implementation needed: Check job status, return video file if completed
@@ -297,21 +369,36 @@ async def get_job_result(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found or result file does not exist.")
 
 
-@app.get("/queue", response_model=QueueStatusResponse)
-async def get_queue_info():
-    # Implementation needed: Get queue status from queue_manager
-    queue_status = queue_manager.get_queue_status()
-    return QueueStatusResponse(queue=queue_status)
+@app.get("/input_image/{job_id}")
+async def get_input_image(job_id: str):
+    """
+    Returns the input JPEG image file associated with a job, potentially including Exif metadata.
+    """
+    job = queue_manager.get_job_by_id(job_id)
+    filename_base = f"queue_image_{job_id}.jpg"  # Changed extension to jpg
+    input_image_path_in_temp = os.path.join(settings.TEMP_QUEUE_IMAGES_DIR, filename_base)
 
+    if not job:
+        # Check if the image file exists even if job is not in queue (e.g., after cleanup)
+        if os.path.exists(input_image_path_in_temp):
+            print(f"Job {job_id} not in queue, but input image file found. Serving file.")
+            # Return JPEG file
+            return FileResponse(input_image_path_in_temp, media_type="image/jpeg", filename=f"input_{job_id}.jpg")
+        else:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found and input image file does not exist.")
 
-@app.get("/worker/status", response_model=WorkerStatusResponse)
-async def get_worker_status():
-    """Returns the current status of the background worker."""
-    global worker_running, currently_processing_job_id
-    return WorkerStatusResponse(
-        is_running=worker_running,
-        processing_job_id=currently_processing_job_id
-    )
+    # Job exists, use the path from the job object (which should also be .jpg now)
+    input_image_path_from_job = job.image_path
+    if not input_image_path_from_job or not os.path.exists(input_image_path_from_job):
+        # As a fallback, check the expected path in temp again, in case job object path is stale
+        if os.path.exists(input_image_path_in_temp):
+            print(f"Warning: Job {job_id} image path mismatch or file missing at '{input_image_path_from_job}', but found at '{input_image_path_in_temp}'. Serving found file.")
+            return FileResponse(input_image_path_in_temp, media_type="image/jpeg", filename=f"input_{job_id}.jpg")
+        else:
+            raise HTTPException(status_code=404, detail=f"Input image file not found for job '{job_id}' at expected paths.")
+
+    # Return JPEG file using path from job object
+    return FileResponse(input_image_path_from_job, media_type="image/jpeg", filename=f"input_{job_id}.jpg")
 
 
 @app.post("/cancel/{job_id}", status_code=200)
@@ -349,6 +436,64 @@ async def cancel_job(job_id: str):
             # If still not found or status isn't completed, raise internal error
             print(f"Failed to update status to cancelled for job {job_id}, job might not exist anymore.")
             raise HTTPException(status_code=500, detail="Failed to request job cancellation. Job might have finished or encountered an issue.")
+
+
+# === Queue & Worker Management ===
+
+@app.get("/queue", response_model=QueueStatusResponse)
+async def get_queue_info():
+    # Implementation needed: Get queue status from queue_manager
+    queue_status = queue_manager.get_queue_status()
+    return QueueStatusResponse(queue=queue_status)
+
+
+@app.get("/worker/status", response_model=WorkerStatusResponse)
+async def get_worker_status():
+    """Returns the current status of the background worker."""
+    global worker_running, currently_processing_job_id
+    return WorkerStatusResponse(
+        is_running=worker_running,
+        processing_job_id=currently_processing_job_id
+    )
+
+
+@app.post("/cleanup_jobs", status_code=200)
+async def trigger_cleanup_jobs():
+    """ # Correct indentation for docstring
+    Manually triggers the cleanup of old completed, cancelled, or failed jobs
+    based on the MAX_COMPLETED_JOBS setting.
+    """
+    try:  # Correct indentation for try block
+        removed_count = queue_manager.cleanup_jobs_by_max_count()
+        return {"message": f"Cleanup process completed. Removed {removed_count} old job entries."}
+    except Exception as e:
+        print(f"Error during manual job cleanup: {e}")  # Correct indentation
+        traceback.print_exc()  # Correct indentation
+        raise HTTPException(status_code=500, detail=f"Failed to perform job cleanup: {e}")
+
+
+# === Settings & Information ===
+
+@app.get("/loras", response_model=LoraListResponse)
+async def list_loras():
+    """Lists available LoRA files from the configured directory."""
+    lora_files = []
+    allowed_extensions = {".safetensors", ".pt", ".bin"}  # Common LoRA extensions
+    try:
+        if os.path.isdir(settings.LORA_DIR):
+            for filename in os.listdir(settings.LORA_DIR):
+                if os.path.isfile(os.path.join(settings.LORA_DIR, filename)):
+                    _, ext = os.path.splitext(filename)
+                    if ext.lower() in allowed_extensions:
+                        lora_files.append(filename)
+            lora_files.sort()  # Sort alphabetically
+        else:
+            print(f"Warning: LORA_DIR '{settings.LORA_DIR}' is not a valid directory.")
+    except Exception as e:
+        print(f"Error listing LoRA files: {e}")
+        # Return empty list on error, or raise HTTPException
+        # raise HTTPException(status_code=500, detail=f"Failed to list LoRA files: {e}")
+    return LoraListResponse(loras=lora_files)  # Correct indentation for return
 
 
 # --- Main execution (for running with uvicorn) ---

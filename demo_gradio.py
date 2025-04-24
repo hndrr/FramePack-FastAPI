@@ -1,13 +1,33 @@
-from diffusers_helper.hf_login import login
-
 import os
-os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
 import json
 import traceback
-from dataclasses import dataclass, asdict
-from typing import Optional
 import uuid
+import argparse
+from dataclasses import dataclass
+
 import numpy as np
+import torch
+import gradio as gr
+import einops
+from PIL import Image, ImageDraw, ImageFont
+from PIL.PngImagePlugin import PngInfo
+from diffusers import AutoencoderKLHunyuanVideo
+from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer, SiglipImageProcessor, SiglipVisionModel
+
+from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
+from diffusers_helper.load_lora import load_lora
+from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, generate_timestamp
+from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
+from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
+from diffusers_helper.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
+from diffusers_helper.thread_utils import AsyncStream, async_run
+from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
+from diffusers_helper.clip_vision import hf_clip_vision_encode
+from diffusers_helper.bucket_tools import find_nearest_bucket
+
+
+os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
+
 # Path to the quick prompts JSON file
 PROMPT_FILE = os.path.join(os.getcwd(), 'quick_prompts.json')
 
@@ -33,30 +53,6 @@ else:
     with open(PROMPT_FILE, 'w') as f:
         json.dump(quick_prompts, f, indent=2)
 
-import gradio as gr
-import torch
-import traceback
-import einops
-import safetensors.torch as sf
-import numpy as np
-import argparse
-import math
-
-from PIL import Image, ImageDraw, ImageFont
-from PIL.PngImagePlugin import PngInfo
-from diffusers import AutoencoderKLHunyuanVideo
-from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
-from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
-from diffusers_helper.load_lora import load_lora
-from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
-from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
-from diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
-from diffusers_helper.memory import cpu, gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation, offload_model_from_device_for_memory_preservation, fake_diffusers_current_device, DynamicSwapInstaller, unload_complete_models, load_model_as_complete
-from diffusers_helper.thread_utils import AsyncStream, async_run
-from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
-from transformers import SiglipImageProcessor, SiglipVisionModel
-from diffusers_helper.clip_vision import hf_clip_vision_encode
-from diffusers_helper.bucket_tools import find_nearest_bucket
 
 @dataclass
 class QueuedJob:
@@ -120,8 +116,10 @@ class QueuedJob:
             print(f"Error creating job from dict: {str(e)}")
             return None
 
+
 # Initialize job queue as a list
 job_queue = []
+
 
 def save_queue():
     try:
@@ -130,7 +128,7 @@ def save_queue():
             job_dict = job.to_dict()
             if job_dict is not None:
                 jobs.append(job_dict)
-        
+
         file_path = os.path.abspath(QUEUE_FILE)
         with open(file_path, 'w') as f:
             json.dump(jobs, f, indent=2)
@@ -139,6 +137,7 @@ def save_queue():
         print(f"Error saving queue: {str(e)}")
         traceback.print_exc()
         return False
+
 
 def load_queue():
     try:
@@ -158,8 +157,10 @@ def load_queue():
         traceback.print_exc()
         return []
 
+
 # Load existing queue on startup
 job_queue = load_queue()
+
 
 def save_image_to_temp(image: np.ndarray, job_id: str) -> str:
     """Save image to temp directory and return the path"""
@@ -179,6 +180,7 @@ def save_image_to_temp(image: np.ndarray, job_id: str) -> str:
         traceback.print_exc()
         return ""
 
+
 def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_preservation, steps, cfg, gs, rs, status="pending", mp4_crf=16):
     try:
         # Generate a unique hex ID for the job
@@ -188,7 +190,7 @@ def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_pre
         image_path = save_image_to_temp(image_array, job_id)
         if not image_path:
             return None
-            
+
         job = QueuedJob(
             prompt=prompt,
             image_path=image_path,
@@ -211,6 +213,7 @@ def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_pre
         print(f"Error adding job to queue: {str(e)}")
         traceback.print_exc()
         return None
+
 
 def get_next_job():
     try:
@@ -250,14 +253,17 @@ def update_queue_display():
             if job.thumbnail:
                 caption = f"{job.status}\n\nPrompt: {job.prompt}...\n\nLength: {job.video_length}s"
                 queue_data.append((job.thumbnail, caption))
-        
+
         return queue_data
     except Exception as e:
         print(f"Error updating queue display: {str(e)}")
         traceback.print_exc()
         return []
 
+
 # Quick prompts management functions
+
+
 def get_default_prompt():
     try:
         if quick_prompts and len(quick_prompts) > 0:
@@ -266,6 +272,7 @@ def get_default_prompt():
     except Exception as e:
         print(f"Error getting default prompt: {str(e)}")
         return "", 5.0
+
 
 def save_quick_prompt(prompt_text, video_length):
     global quick_prompts
@@ -277,11 +284,12 @@ def save_quick_prompt(prompt_text, video_length):
                 break
         else:
             quick_prompts.append({'prompt': prompt_text, 'length': video_length})
-        
+
         with open(PROMPT_FILE, 'w') as f:
             json.dump(quick_prompts, f, indent=2)
     # Keep the text in the prompt box and set it as selected in quick list
     return prompt_text, gr.update(choices=[item['prompt'] for item in quick_prompts], value=prompt_text), video_length
+
 
 def delete_quick_prompt(prompt_text):
     global quick_prompts
@@ -292,12 +300,14 @@ def delete_quick_prompt(prompt_text):
     # Clear the prompt box and quick list selection
     return "", gr.update(choices=[item['prompt'] for item in quick_prompts], value=None), 5.0
 
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
 parser.add_argument("--server", type=str, default='0.0.0.0')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 parser.add_argument("--lora", type=str, default=None, help="Lora path")
+parser.add_argument("--lora_scale", type=float, default=1.0, help="Lora scale factor (weight)")
 args = parser.parse_args()
 
 # for win desktop probably use --server 127.0.0.1 --inbrowser
@@ -351,7 +361,7 @@ if args.lora:
     lora = args.lora
     lora_path, lora_name = os.path.split(lora)
     print("Loading lora")
-    transformer = load_lora(transformer, lora_path, lora_name)
+    transformer = load_lora(transformer, lora_path, lora_name, lora_scale=args.lora_scale)
 
 if not high_vram:
     # DynamicSwapInstaller is same as huggingface's enable_sequential_offload but 3x faster
@@ -583,7 +593,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             if is_last_section:
                 break
-    except:
+    except Exception as e:
+        print(f"Error during worker execution: {e}")
         traceback.print_exc()
 
         if not high_vram:
@@ -604,14 +615,14 @@ def create_status_thumbnail(image_path, status, border_color, status_text):
         new_height = 200
         new_width = int((new_height / height) * width)
         img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
+
         # Add border
         border_size = 5
-        img_with_border = Image.new('RGB', 
-            (img.width + border_size*2, img.height + border_size*2), 
-            border_color)
+        img_with_border = Image.new('RGB',
+                                    (img.width + border_size * 2, img.height + border_size * 2),
+                                    border_color)
         img_with_border.paste(img, (border_size, border_size))
-        
+
         # Add status text
         draw = ImageDraw.Draw(img_with_border)
         # Use smaller font size for RUNNING text
@@ -621,37 +632,38 @@ def create_status_thumbnail(image_path, status, border_color, status_text):
         text_bbox = draw.textbbox((0, 0), text, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         text_height = text_bbox[3] - text_bbox[1]
-        
+
         # Position text in center
         x = (img_with_border.width - text_width) // 2
         y = (img_with_border.height - text_height) // 2
-        
+
         # Draw text with black outline
-        for offset in [(-1,-1), (-1,1), (1,-1), (1,1)]:
-            draw.text((x+offset[0], y+offset[1]), text, font=font, fill=(0,0,0))
-        draw.text((x, y), text, font=font, fill=(255,255,255))
-        
+        for offset in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            draw.text((x + offset[0], y + offset[1]), text, font=font, fill=(0, 0, 0))
+        draw.text((x, y), text, font=font, fill=(255, 255, 255))
+
         return img_with_border
     except Exception as e:
         print(f"Error creating status thumbnail: {str(e)}")
         traceback.print_exc()
         return None
 
+
 def mark_job_processing(job):
     """Mark a job as processing and update its thumbnail with a red border and RUNNING text"""
     try:
         job.status = "processing"
-        
+
         # Delete existing thumbnail if it exists
         if job.thumbnail and os.path.exists(job.thumbnail):
             os.remove(job.thumbnail)
-        
+
         # Create new thumbnail with processing status
         if job.image_path and os.path.exists(job.image_path):
             # Create thumbnail path if it doesn't exist
             if not job.thumbnail:
                 job.thumbnail = os.path.join(temp_queue_images, f"thumb_{job.job_id}.png")
-            
+
             new_thumbnail = create_status_thumbnail(
                 job.image_path,
                 "processing",
@@ -660,26 +672,27 @@ def mark_job_processing(job):
             )
             if new_thumbnail:
                 new_thumbnail.save(job.thumbnail)
-            
+
     except Exception as e:
         print(f"Error modifying thumbnail: {str(e)}")
         traceback.print_exc()
+
 
 def mark_job_completed(job):
     """Mark a job as completed and update its thumbnail with a green border and DONE text"""
     try:
         job.status = "completed"
-        
+
         # Delete existing thumbnail if it exists
         if job.thumbnail and os.path.exists(job.thumbnail):
             os.remove(job.thumbnail)
-        
+
         # Create new thumbnail with completed status
         if job.image_path and os.path.exists(job.image_path):
             # Create thumbnail path if it doesn't exist
             if not job.thumbnail:
                 job.thumbnail = os.path.join(temp_queue_images, f"thumb_{job.job_id}.png")
-            
+
             new_thumbnail = create_status_thumbnail(
                 job.image_path,
                 "completed",
@@ -688,47 +701,49 @@ def mark_job_completed(job):
             )
             if new_thumbnail:
                 new_thumbnail.save(job.thumbnail)
-            
+
     except Exception as e:
         print(f"Error modifying thumbnail: {str(e)}")
         traceback.print_exc()
+
 
 def mark_job_pending(job):
     """Mark a job as pending and update its thumbnail to a clean version without border or text"""
     try:
         job.status = "pending"
-        
+
         # Delete existing thumbnail if it exists
         if job.thumbnail and os.path.exists(job.thumbnail):
             os.remove(job.thumbnail)
-        
+
         # Create new clean thumbnail
         if job.image_path and os.path.exists(job.image_path):
             # Create thumbnail path if it doesn't exist
             if not job.thumbnail:
                 job.thumbnail = os.path.join(temp_queue_images, f"thumb_{job.job_id}.png")
-            
+
             # Load and resize image for thumbnail
             img = Image.open(job.image_path)
             width, height = img.size
             new_height = 200
             new_width = int((new_height / height) * width)
             img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
+
             # Save clean thumbnail
             img.save(job.thumbnail)
-            
+
     except Exception as e:
         print(f"Error modifying thumbnail: {str(e)}")
         traceback.print_exc()
 
+
 def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
     global stream
-    
+
     # Initialize variables
     output_filename = None
     job_id = None
-    
+
     # Convert Gallery tuples to numpy arrays if needed
     if input_image is None:
         input_image = None
@@ -737,7 +752,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
     else:
         # Single image case
         input_image = np.array(Image.open(input_image[0]))
-    
+
     # Handle multiple input images
     if isinstance(input_image, list) and len(input_image) > 1:
         # For multiple images, add each as a separate job to the queue
@@ -757,10 +772,10 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
                 status=status,
                 mp4_crf=mp4_crf
             )
-        
+
         # After adding all jobs, process the first one
         input_image = input_image[0]
-    
+
     # Determine which job to process
     if input_image is not None:
         # Check for just_added jobs first
@@ -770,14 +785,14 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
             mark_job_processing(next_job)  # Use new function to mark as processing
             save_queue()
             job_id = next_job.job_id
-            
+
             try:
                 process_image = np.array(Image.open(next_job.image_path))
             except Exception as e:
                 print(f"ERROR loading image: {str(e)}")
                 traceback.print_exc()
                 raise
-            
+
             process_prompt = next_job.prompt
             process_seed = next_job.seed
             process_length = next_job.video_length
@@ -822,20 +837,20 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
         pending_jobs = [job for job in job_queue if job.status.lower() == "pending"]
         if not pending_jobs:
             assert input_image is not None, 'No input image!'
-        
+
         # Process first pending job
         next_job = pending_jobs[0]
         mark_job_processing(next_job)  # Use new function to mark as processing
         save_queue()
         job_id = next_job.job_id
-        
+
         try:
             process_image = np.array(Image.open(next_job.image_path))
         except Exception as e:
             print(f"ERROR loading image: {str(e)}")
             traceback.print_exc()
             raise
-        
+
         process_prompt = next_job.prompt
         process_seed = next_job.seed
         process_length = next_job.video_length
@@ -845,14 +860,14 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
         process_rs = next_job.rs
         process_preservation = next_job.gpu_memory_preservation
         process_teacache = next_job.use_teacache
-    
+
     # Start processing
     stream = AsyncStream()
-    async_run(worker, process_image, process_prompt, n_prompt, process_seed, 
-             process_length, latent_window_size, process_steps, 
-             process_cfg, process_gs, process_rs, 
-             process_preservation, process_teacache, mp4_crf)
-    
+    async_run(worker, process_image, process_prompt, n_prompt, process_seed,
+              process_length, latent_window_size, process_steps,
+              process_cfg, process_gs, process_rs,
+              process_preservation, process_teacache, mp4_crf)
+
     # Initial yield with updated queue display and button states
     yield (
         None,  # result_video
@@ -907,7 +922,7 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
             if not stream.input_queue.top() == 'end':
                 # Find next job to process
                 next_job = None
-                
+
                 # First check for pending jobs
                 pending_jobs = [job for job in job_queue if job.status.lower() == "pending"]
                 if pending_jobs:
@@ -922,19 +937,19 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
                     # Update next job status to processing
                     mark_job_processing(next_job)  # Use new function to mark as processing
                     save_queue()
-                    
+
                     try:
                         next_image = np.array(Image.open(next_job.image_path))
                     except Exception as e:
                         print(f"ERROR loading next image: {str(e)}")
                         traceback.print_exc()
                         raise
-                    
+
                     # Process next job
-                    async_run(worker, next_image, next_job.prompt, n_prompt, next_job.seed, 
-                             next_job.video_length, latent_window_size, next_job.steps, 
-                             next_job.cfg, next_job.gs, next_job.rs, 
-                             next_job.gpu_memory_preservation, next_job.use_teacache, mp4_crf)
+                    async_run(worker, next_image, next_job.prompt, n_prompt, next_job.seed,
+                              next_job.video_length, latent_window_size, next_job.steps,
+                              next_job.cfg, next_job.gs, next_job.rs,
+                              next_job.gpu_memory_preservation, next_job.use_teacache, mp4_crf)
                 else:
                     job_queue[:] = [job for job in job_queue if job.status != "completed"]
                     save_queue()
@@ -966,12 +981,13 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
                 )
                 break
 
+
 def end_process():
     """Handle end generation button click - stop all processes and change all processing jobs to pending jobs"""
     try:
         # First send the end signal to stop all processes
         stream.input_queue.push('end')
-        
+
         # Find and update all processing jobs
         jobs_changed = 0
         processing_job = None
@@ -982,18 +998,18 @@ def end_process():
             if job.status == "processing":
                 processing_job = job
                 break
-        
+
         # Then process all jobs
         for job in job_queue:
             if job.status == "processing":
                 mark_job_pending(job)  # Use new function to mark as pending
                 jobs_changed += 1
-        
+
         # If we found a processing job, move it to the top
         if processing_job:
             job_queue.remove(processing_job)
             job_queue.insert(0, processing_job)
-        
+
         save_queue()
         return (
             update_queue_display(),  # queue_display
@@ -1004,22 +1020,23 @@ def end_process():
         traceback.print_exc()
         return [], gr.update(interactive=True)  # queue_button (always enabled)
 
+
 def add_to_queue_handler(input_image, prompt, total_second_length, seed, use_teacache, gpu_memory_preservation, steps, cfg, gs, rs, mp4_crf):
     """Handle adding a new job to the queue"""
     if input_image is None or not prompt:
         return [], gr.update(interactive=True)  # queue_button (always enabled)
-    
+
     try:
         # Convert Gallery tuples to numpy arrays if needed
         if isinstance(input_image, list):
             # Multiple images case
             input_images = [np.array(Image.open(img[0])) for img in input_image]
-            
+
             # Change any existing just_added jobs to pending
             for job in job_queue:
                 if job.status == "just_added":
                     job.status = "pending"
-            
+
             # Add each image as a separate job with pending status
             for img in input_images:
                 job_id = add_to_queue(
@@ -1039,12 +1056,12 @@ def add_to_queue_handler(input_image, prompt, total_second_length, seed, use_tea
         else:
             # Single image case
             input_image = np.array(Image.open(input_image[0]))
-            
+
             # Change any existing just_added jobs to pending
             for job in job_queue:
                 if job.status == "just_added":
                     job.status = "pending"
-            
+
             # Add single image job
             job_id = add_to_queue(
                 prompt=prompt,
@@ -1060,7 +1077,7 @@ def add_to_queue_handler(input_image, prompt, total_second_length, seed, use_tea
                 status="pending",  # Single image gets pending status when using Add to Queue
                 mp4_crf=mp4_crf
             )
-        
+
         if job_id is not None:
             save_queue()  # Save after changing statuses
             return update_queue_display(), gr.update(interactive=True)  # queue_button (always enabled)
@@ -1070,6 +1087,7 @@ def add_to_queue_handler(input_image, prompt, total_second_length, seed, use_tea
         print(f"Error in add_to_queue_handler: {str(e)}")
         traceback.print_exc()
         return [], gr.update(interactive=True)  # queue_button (always enabled)
+
 
 def cleanup_orphaned_files():
     """Clean up any temp files that don't correspond to jobs in the queue"""
@@ -1081,16 +1099,16 @@ def cleanup_orphaned_files():
                 job_files.add(job.image_path)
             if job.thumbnail:
                 job_files.add(job.thumbnail)
-        
+
         # Get all files in temp directory
         temp_files = set()
         for root, _, files in os.walk(temp_queue_images):
             for file in files:
                 temp_files.add(os.path.join(root, file))
-        
+
         # Find orphaned files (in temp but not in queue)
         orphaned_files = temp_files - job_files
-        
+
         # Delete orphaned files
         for file in orphaned_files:
             try:
@@ -1101,6 +1119,7 @@ def cleanup_orphaned_files():
     except Exception as e:
         print(f"Error in cleanup_orphaned_files: {str(e)}")
         traceback.print_exc()
+
 
 def reset_processing_jobs():
     """Reset any processing or just_added jobs to pending and move them to top of queue"""
@@ -1113,23 +1132,24 @@ def reset_processing_jobs():
             if job.status in ("processing", "just_added"):
                 print(f"Found job {job.job_id} with status {job.status}")
                 jobs_to_move.append(job)
-        
+
         # Remove these jobs from their current positions
         for job in jobs_to_move:
             job_queue.remove(job)
             mark_job_pending(job)  # Use new function to mark as pending
             print(f"Changed job {job.job_id} status to pending")
-        
+
         # Add them back at the top in reverse order (so they maintain their relative order)
         for job in reversed(jobs_to_move):
             job_queue.insert(0, job)
             print(f"Moved job {job.job_id} to top of queue")
-        
+
         save_queue()
         print(f"Queue saved with {len(jobs_to_move)} jobs moved to top")
     except Exception as e:
         print(f"Error in reset_processing_jobs: {str(e)}")
         traceback.print_exc()
+
 
 def delete_job(job_id):
     """Delete a job from the queue and its associated files"""
@@ -1151,10 +1171,10 @@ def delete_job(job_id):
         traceback.print_exc()
         return update_queue_display()
 
+
 # Add these calls at startup
 reset_processing_jobs()
 cleanup_orphaned_files()
-
 # Add custom CSS for the queue display
 css = make_progress_bar_css() + """
 .gradio-gallery-container {
@@ -1251,13 +1271,13 @@ with block:
                 start_button = gr.Button(value="Start Generation", interactive=True)
                 end_button = gr.Button(value="End Generation", interactive=False)
                 queue_button = gr.Button(value="Add to Queue", interactive=True)
-            
+
             preview_image = gr.Image(label="Next Latents", height=200, visible=False)
             result_video = gr.Video(label="Finished Frames", autoplay=True, show_share_button=False, height=512, loop=True)
             gr.Markdown('Note that the ending actions will be generated before the starting actions due to the inverted sampling. If the starting action is not in the video, you just need to wait, and it will be generated later.')
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
-            
+
             queue_display = gr.Gallery(
                 label="Job Queue",
                 show_label=True,
@@ -1281,8 +1301,8 @@ with block:
 
     ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
     start_button.click(
-        fn=process, 
-        inputs=ips, 
+        fn=process,
+        inputs=ips,
         outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, queue_button, queue_display]
     )
     end_button.click(
