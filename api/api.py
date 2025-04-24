@@ -3,9 +3,11 @@ import os
 import time
 import threading
 import traceback
-from contextlib import asynccontextmanager  # Import from standard library
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
-from fastapi.responses import FileResponse
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request  # Request を追加
+from fastapi.responses import FileResponse, StreamingResponse  # StreamingResponse を追加
 from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
@@ -417,7 +419,64 @@ async def trigger_cleanup_jobs():
     except Exception as e:
         print(f"Error during manual job cleanup: {e}")  # Correct indentation
         traceback.print_exc()  # Correct indentation
-        raise HTTPException(status_code=500, detail=f"Failed to perform job cleanup: {e}")  # Correct indentation
+        raise HTTPException(status_code=500, detail=f"Failed to perform job cleanup: {e}")
+
+
+@app.get("/stream/status/{job_id}")
+async def stream_job_status(job_id: str, request: Request):
+    """
+    Streams the status and progress of a job using Server-Sent Events (SSE).
+    """
+    async def event_generator():
+        last_data_sent = None
+        # terminal_statuses = {"completed", "cancelled"} # Unused variable removed
+
+        while True:
+            # Check if client disconnected
+            if await request.is_disconnected():
+                print(f"Client disconnected from job {job_id} stream.")
+                break
+
+            job = queue_manager.get_job_by_id(job_id)
+
+            if not job:
+                # Handle case where job might be cleaned up or never existed
+                # Send a final message and close
+                error_data = json.dumps({"status": "error", "message": "Job not found or cleaned up."})
+                yield f"event: status\ndata: {error_data}\n\n"
+                print(f"Job {job_id} not found for streaming, closing connection.")
+                break
+
+            # Prepare data payload
+            current_data = {
+                "job_id": job.job_id,
+                "status": job.status,
+                "progress": getattr(job, 'progress', 0.0),
+                "progress_step": getattr(job, 'progress_step', 0),
+                "progress_total": getattr(job, 'progress_total', 0),
+                "progress_info": getattr(job, 'progress_info', '')
+            }
+            current_data_json = json.dumps(current_data)
+
+            # Send data only if it has changed since last time
+            if current_data_json != last_data_sent:
+                yield f"event: progress\ndata: {current_data_json}\n\n"
+                last_data_sent = current_data_json
+                print(f"Sent progress update for job {job_id}: Status {job.status}, Progress {current_data['progress']:.1f}%")
+
+            # Check for terminal status (completed, cancelled, failed)
+            is_terminal = job.status == "completed" or job.status == "cancelled" or job.status.startswith("failed")
+            if is_terminal:
+                # Send final status event
+                final_data = json.dumps({"status": job.status, "message": "Job finished."})
+                yield f"event: status\ndata: {final_data}\n\n"
+                print(f"Job {job_id} reached terminal state: {job.status}. Closing stream.")
+                break  # Exit loop after sending final status
+
+            # Wait before checking again
+            await asyncio.sleep(1)  # Check every 1 second
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 # --- Main execution (for running with uvicorn) ---
