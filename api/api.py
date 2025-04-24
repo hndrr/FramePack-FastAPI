@@ -350,6 +350,21 @@ async def stream_job_status(job_id: str, request: Request):
             # Check for terminal status (completed, cancelled, failed)
             is_terminal = job.status == "completed" or job.status == "cancelled" or job.status.startswith("failed")
             if is_terminal:
+                # Send final status event if it hasn't been sent already
+                if current_data_json != last_data_sent:
+                    yield f"event: progress\ndata: {current_data_json}\n\n"
+                    last_data_sent = current_data_json # Ensure last_data_sent is updated even for the final message
+                    print(f"Sent final progress update for job {job_id}: Status {job.status}")
+
+                # Send a dedicated 'status' event to signal completion/failure/cancellation
+                final_status_data = json.dumps({"status": job.status, "message": "Job finished."})
+                yield f"event: status\ndata: {final_status_data}\n\n"
+                print(f"Job {job_id} reached terminal state: {job.status}. Closing stream.")
+                break  # Exit loop after sending final status
+
+            # Wait before checking again only if not terminal
+            await asyncio.sleep(1)  # Check every 1 second
+            if is_terminal:
                 # Send final status event
                 final_data = json.dumps({"status": job.status, "message": "Job finished."})
                 yield f"event: status\ndata: {final_data}\n\n"
