@@ -146,7 +146,7 @@ class LoraListResponse(BaseModel):
 
 class ResultResponse(BaseModel):
     video_url: str
-    thumbnail_base64: Optional[str] = None  # サムネイルは存在しない場合もあるためOptional
+    thumbnail_base64: Optional[str] = None
 
 
 # --- Background Worker ---
