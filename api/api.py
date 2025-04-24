@@ -361,9 +361,9 @@ async def stream_job_status(job_id: str, request: Request):
                 yield f"event: status\ndata: {final_status_data}\n\n"
                 print(f"Job {job_id} reached terminal state: {job.status}. Closing stream.")
                 break  # Exit loop after sending final status
-
-            # Wait before checking again only if not terminal
-            await asyncio.sleep(1)  # Check every 1 second
+            else:
+                # Wait before checking again only if not terminal
+                await asyncio.sleep(1)  # Check every 1 second
             if is_terminal:
                 # Send final status event
                 final_data = json.dumps({"status": job.status, "message": "Job finished."})
