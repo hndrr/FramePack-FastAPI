@@ -91,10 +91,10 @@ app = FastAPI(title="FramePack API", version="0.1.0", lifespan=lifespan)
 # --- CORS Middleware Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS, # Use the loaded origins from settings
-    allow_credentials=True, # Allow credentials (cookies, authorization headers, etc.)
-    allow_methods=["*"], # Allow all methods (GET, POST, etc.)
-    allow_headers=["*"], # Allow all headers (Content-Type, Authorization, etc.)
+    allow_origins=settings.ALLOWED_ORIGINS,  # Use the loaded origins from settings
+    allow_credentials=True,  # Allow credentials (cookies, authorization headers, etc.)
+    allow_methods=["*"],  # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allow all headers (Content-Type, Authorization, etc.)
 )
 # --- End CORS Middleware Configuration ---
 
