@@ -11,6 +11,13 @@ load_dotenv(dotenv_path=dotenv_path)
 API_HOST = "0.0.0.0"  # Listen on all available network interfaces
 API_PORT = int(os.environ.get("API_PORT", 8080))  # Load from env var, default to 8080
 
+# CORS Settings
+# 環境変数からカンマ区切りのオリジンリストを読み込む
+# デフォルトは開発環境のフロントエンドとAPIサーバー自身
+default_origins = "http://localhost:5173,http://localhost:8080"
+ALLOWED_ORIGINS_STR = os.environ.get("ALLOWED_ORIGINS", default_origins)
+ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_STR.split(',') if origin.strip()]
+
 # Model Settings (Consider making these paths absolute or relative to a known root)
 
 # Directory Settings (Relative to project root, one level up from this file's directory)
@@ -47,6 +54,7 @@ print(f"  Queue File Path: {QUEUE_FILE_PATH}")
 print(f"  HF Home Dir: {HF_HOME_DIR}")
 print(f"  LoRA Dir: {LORA_DIR}")
 print(f"  Worker Check Interval: {WORKER_CHECK_INTERVAL}")
+print(f"  Allowed Origins: {ALLOWED_ORIGINS}")
 
 # --- Job Cleanup Settings ---
 # Maximum number of completed, cancelled, or failed jobs to keep in the queue file.

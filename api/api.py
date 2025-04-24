@@ -7,7 +7,8 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request  # Request を追加
-from fastapi.responses import FileResponse, StreamingResponse  # StreamingResponse を追加
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
@@ -40,7 +41,7 @@ async def lifespan(app: FastAPI):
         # Consider running blocking IO in a threadpool executor in async context
         # e.g., await asyncio.to_thread(models.load_models)  # lora_path removed
         # For simplicity now, keeping the direct call but be aware of potential blocking
-        loaded_models = models.load_models()  # lora_path 引数を削除
+        loaded_models = models.load_models()
         print("Models loaded successfully via lifespan.")
     except Exception as e:
         print(f"FATAL: Failed to load models on startup via lifespan: {e}")
@@ -86,6 +87,16 @@ async def lifespan(app: FastAPI):
 # --- FastAPI App Initialization ---
 # Use the lifespan context manager
 app = FastAPI(title="FramePack API", version="0.1.0", lifespan=lifespan)
+
+# --- CORS Middleware Configuration ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS, # Use the loaded origins from settings
+    allow_credentials=True, # Allow credentials (cookies, authorization headers, etc.)
+    allow_methods=["*"], # Allow all methods (GET, POST, etc.)
+    allow_headers=["*"], # Allow all headers (Content-Type, Authorization, etc.)
+)
+# --- End CORS Middleware Configuration ---
 
 
 # --- Pydantic Models for API Requests/Responses ---
