@@ -3,11 +3,10 @@ import torch
 from fastapi.testclient import TestClient
 import io
 import os
-import time
-import stat
-import sys    # Import sys to modify sys.modules
+import sys  # Import sys to modify sys.modules
+import base64
 # import asyncio # Not directly used when only AsyncMock is needed
-from unittest.mock import AsyncMock  # For async context manager mock
+from unittest.mock import mock_open
 from PIL import Image
 from api import queue_manager, settings  # settings をインポート
 
@@ -79,16 +78,14 @@ def create_dummy_image(width=100, height=50, format="PNG"):
     img.save(img_byte_arr, format=format)
     img_byte_arr.seek(0)
     return img_byte_arr
-# --- Test cases will go below ---
 
 
 @pytest.mark.parametrize(
     "lora_path_param, lora_scale_param, expected_lora_path_in_queue, expected_lora_scale_in_queue",
     [
-        ("test_lora.safetensors", 0.8, "test_lora.safetensors", 0.8),  # Path and scale specified
-        ("another_lora.pt", None, "another_lora.pt", 1.0),       # Path specified, scale default
-        (None, None, None, 1.0),                                 # Path omitted, scale default (LoRA not applied by worker)
-        # ("", 0.5, "", 0.5), # Empty string path test removed based on latest logic
+        ("test_lora.safetensors", 0.8, "test_lora.safetensors", 0.8),
+        ("another_lora.pt", None, "another_lora.pt", 1.0),
+        (None, None, None, 1.0),
     ]
 )
 def test_generate_job_success(mocker, lora_path_param, lora_scale_param, expected_lora_path_in_queue, expected_lora_scale_in_queue):
@@ -111,10 +108,9 @@ def test_generate_job_success(mocker, lora_path_param, lora_scale_param, expecte
     # Prepare form data
     data = {
         "prompt": "A test prompt",
-        "video_length": 1.0,  # Use short length for test
+        "video_length": 1.0,
         "seed": 12345,
-        "steps": 5,  # Use fewer steps for test
-        # Add other required form fields with default or test values
+        "steps": 5,
         "use_teacache": True,
         "gpu_memory_preservation": 6.0,
         "cfg": 7.0,
@@ -138,11 +134,10 @@ def test_generate_job_success(mocker, lora_path_param, lora_scale_param, expecte
     assert response_json["message"] == "Video generation job added to queue."
 
     # Verify that add_to_queue was called with the correct arguments
-    # Need to use mocker.ANY for the image numpy array as it's hard to replicate exactly
     mock_add_to_queue.assert_called_once_with(
         prompt=data["prompt"],
         image=mocker.ANY,
-        original_exif=None,  # Add check for the new exif argument (expect None in test)
+        original_exif=None,
         video_length=data["video_length"],
         seed=data["seed"],
         use_teacache=data["use_teacache"],
@@ -152,8 +147,8 @@ def test_generate_job_success(mocker, lora_path_param, lora_scale_param, expecte
         gs=data["gs"],
         rs=data["rs"],
         mp4_crf=data["mp4_crf"],
-        lora_scale=expected_lora_scale_in_queue,  # Check expected scale
-        lora_path=expected_lora_path_in_queue,    # Check expected path
+        lora_scale=expected_lora_scale_in_queue,
+        lora_path=expected_lora_path_in_queue,
         status="pending"
     )
 
@@ -175,9 +170,8 @@ def test_get_status_pending(mocker):
         gpu_memory_preservation=0.0,
         steps=10,
         cfg=7.0, gs=1.0, rs=1.0,
-        status="pending",  # Explicitly set status
+        status="pending",
         mp4_crf=16.0,
-        # Progress fields should have defaults
     )
 
     # Mock get_job_by_id to return our mock job data
@@ -195,13 +189,11 @@ def test_get_status_pending(mocker):
     response_json = response.json()
     assert response_json["job_id"] == mock_job_id
     assert response_json["status"] == "pending"
-    assert response_json["progress"] == 0.0  # Default progress
-    assert response_json["progress_info"] == ""  # Default info
+    assert response_json["progress"] == 0.0
+    assert response_json["progress_info"] == ""
 
     # Verify mocks were called as expected
     queue_manager.get_job_by_id.assert_called_once_with(mock_job_id)
-    # os.path.exists might be called by get_job_by_id or the endpoint, check its call
-    # os.path.exists.assert_called_once() # Be more specific about the path if needed
 
 
 def test_get_status_processing(mocker):
@@ -218,9 +210,8 @@ def test_get_status_processing(mocker):
         gpu_memory_preservation=6.0,
         steps=20,
         cfg=7.0, gs=1.0, rs=1.0,
-        status="processing",  # Set status
+        status="processing",
         mp4_crf=16.0,
-        # Set some progress
         progress=55.5,
         progress_step=11,
         progress_total=20,
@@ -269,16 +260,11 @@ def test_get_status_completed(mocker):
     response_json = response.json()
     assert response_json["job_id"] == mock_job_id
     assert response_json["status"] == "completed"
-    assert response_json["progress"] == 100.0  # Should indicate 100%
-    assert response_json["progress_info"] == "Completed"  # Should indicate completed
+    assert response_json["progress"] == 100.0
+    assert response_json["progress_info"] == "Completed"
 
     # Verify mocks
     queue_manager.get_job_by_id.assert_called_once_with(mock_job_id)
-    # Verify os.path.exists was called (likely with the expected output path)
-    # We need api.settings to construct the exact path for a more precise check
-    # mocker.patch('api.settings.OUTPUTS_DIR', './test_outputs') # Example: override settings for test
-    # expected_path = os.path.join('./test_outputs', f"{mock_job_id}.mp4")
-    # os.path.exists.assert_called_once_with(expected_path)
 
 
 def test_get_status_not_found(mocker):
@@ -301,8 +287,6 @@ def test_get_status_not_found(mocker):
 
     # Verify mocks
     queue_manager.get_job_by_id.assert_called_once_with(mock_job_id)
-    # os.path.exists should also have been called
-    # os.path.exists.assert_called_once() # More specific path check if needed
 
 
 def test_get_result_completed(mocker):
@@ -312,42 +296,52 @@ def test_get_result_completed(mocker):
     mock_job_data = queue_manager.QueuedJob(
         prompt="completed prompt", image_path="/fake/completed.png", video_length=1.0,
         job_id=mock_job_id, seed=1, use_teacache=True, gpu_memory_preservation=0,
-        steps=1, cfg=1, gs=1, rs=1, status="completed", mp4_crf=16
+        steps=1, cfg=1, gs=1, rs=1, status="completed", mp4_crf=16,
+        thumbnail="/fake/thumb_resultjobDEF.jpg"  # サムネイルパスを追加
     )
     # Mock get_job_by_id to return the completed job
     mocker.patch("api.queue_manager.get_job_by_id", return_value=mock_job_data)
-    # Mock os.path.exists for the output file check to return True
-    mocker.patch("os.path.exists", return_value=True)
-    # Mock os.stat to return dummy file info, preventing FileNotFoundError inside FileResponse
-    # Set st_mode to indicate a regular file using stat.S_IFREG
-    dummy_stat_result = os.stat_result((
-        stat.S_IFREG, 0, 0, 0, 0, 0, 1024, 0, time.time(), 0  # st_mode, st_size=1024, st_mtime=now
-    ))
-    mocker.patch("os.stat", return_value=dummy_stat_result)
-    # Mock FileResponse class itself to prevent actual file reading/sending if stat passes
-    # We still mock the class to check if it was called.
-    # Patch FileResponse where it's used (in the api.api module)
-    mock_file_response_cls = mocker.patch("api.api.FileResponse")
 
-    # Mock anyio.open_file to prevent actual file reading attempt
-    # Create a mock async context manager that simulates reading a file
-    mock_async_file_context = AsyncMock()
-    mock_file_object = AsyncMock()
-    # Configure the read method to return dummy data once, then empty bytes
-    mock_file_object.read.side_effect = [b"dummy video data chunk 1", b""]
-    mock_async_file_context.__aenter__.return_value = mock_file_object
-    mocker.patch("anyio.open_file", return_value=mock_async_file_context)
+    # Mock os.path.exists to return True for both video and thumbnail
+    def mock_exists(path):
+        if path == os.path.join(settings.OUTPUTS_DIR, f"{mock_job_id}.mp4"):
+            return True
+        if path == mock_job_data.thumbnail:
+            return True
+        return False
+    mocker.patch("os.path.exists", side_effect=mock_exists)
+
+    # Mock built-in open for reading the thumbnail file
+    dummy_thumbnail_data = b"dummy_jpeg_data"
+    mock_file = mock_open(read_data=dummy_thumbnail_data)
+    # Patch open in the context where it's used (api.api)
+    mocker.patch("api.api.open", mock_file)
+
+    # Mock mimetypes.guess_type and capture the mock object
+    mock_guess_type = mocker.patch("api.api.mimetypes.guess_type", return_value=("image/jpeg", None))
 
     # Send the GET request
+    # TestClient automatically uses a base URL like http://testserver
     response = client.get(f"/result/{mock_job_id}")
 
     # Assertions
     assert response.status_code == 200
-    # Check if FileResponse was called with expected arguments
-    # Need api.settings to construct the exact path
-    # expected_path = os.path.join(settings.OUTPUTS_DIR, f"{mock_job_id}.mp4")
-    # mock_file_response_cls.assert_called_once_with(expected_path, media_type="video/mp4", filename=f"{mock_job_id}.mp4")
-    mock_file_response_cls.assert_called_once()  # Restore the check
+    response_json = response.json()
+    assert "video_url" in response_json
+    assert "thumbnail_base64" in response_json
+
+    # Check video URL (assuming default TestClient base URL)
+    expected_video_url = f"http://testserver/download/video/{mock_job_id}"
+    assert response_json["video_url"] == expected_video_url
+
+    # Check thumbnail Base64 data
+    expected_base64_data = base64.b64encode(dummy_thumbnail_data).decode("utf-8")
+    expected_thumbnail_base64 = f"data:image/jpeg;base64,{expected_base64_data}"
+    assert response_json["thumbnail_base64"] == expected_thumbnail_base64
+
+    # Verify mocks related to thumbnail reading
+    mock_file.assert_called_once_with(mock_job_data.thumbnail, "rb")
+    mock_guess_type.assert_called_once_with(mock_job_data.thumbnail)  # Use the captured mock object
 
 
 def test_get_result_not_completed(mocker):
@@ -374,8 +368,6 @@ def test_get_result_not_completed(mocker):
 
     # Verify mocks
     queue_manager.get_job_by_id.assert_called_once_with(mock_job_id)
-    # os.path.exists should also have been called
-    # os.path.exists.assert_called_once() # More specific path check if needed
 
 
 def test_get_result_not_found(mocker):
@@ -397,8 +389,6 @@ def test_get_result_not_found(mocker):
 
     # Verify mocks
     queue_manager.get_job_by_id.assert_called_once_with(mock_job_id)
-    # os.path.exists should also have been called
-    # os.path.exists.assert_called_once() # More specific path check if needed
 
 
 def test_cancel_job_success(mocker):
