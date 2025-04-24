@@ -141,7 +141,8 @@ def test_generate_job_success(mocker, lora_path_param, lora_scale_param, expecte
     # Need to use mocker.ANY for the image numpy array as it's hard to replicate exactly
     mock_add_to_queue.assert_called_once_with(
         prompt=data["prompt"],
-        image=mocker.ANY,  # Check type later if needed: isinstance(call_args[1]['image'], np.ndarray)
+        image=mocker.ANY,
+        original_exif=None,  # Add check for the new exif argument (expect None in test)
         video_length=data["video_length"],
         seed=data["seed"],
         use_teacache=data["use_teacache"],

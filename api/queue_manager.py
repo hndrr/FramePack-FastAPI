@@ -8,7 +8,7 @@ from dataclasses import dataclass, field  # Import field
 from typing import Optional
 from datetime import datetime, timezone  # Import datetime and timezone
 from PIL import Image
-from PIL.PngImagePlugin import PngInfo
+# from PIL.PngImagePlugin import PngInfo # No longer needed for JPEG saving
 
 from . import settings  # Import settings to get paths
 
@@ -46,8 +46,11 @@ class QueuedJob:
     lora_path: Optional[str] = None
     # Add updated_at timestamp, default to current UTC time
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Add field for original Exif data (bytes) - will not be saved in JSON
+    original_exif: Optional[bytes] = field(default=None, repr=False)
 
     def to_dict(self):
+        # Exclude original_exif from the dictionary saved to JSON
         try:
             # Convert datetime to ISO 8601 string format for JSON serialization
             updated_at_iso = self.updated_at.isoformat() if self.updated_at else None
@@ -177,26 +180,32 @@ def load_queue_from_file() -> list[QueuedJob]:
 job_queue = load_queue_from_file()
 
 
-def save_image_to_temp(image: np.ndarray, job_id: str, prompt: str, seed: int) -> str:
-    """Save image to temp directory with metadata and return the path"""
+def save_image_to_temp(image: np.ndarray, job_id: str, prompt: str, seed: int, exif_data: Optional[bytes] = None) -> str:
+    """Save image to temp directory as JPEG with Exif metadata and return the path"""
     try:
         # Convert numpy array to PIL Image
         squeezed_image = np.squeeze(image)
         pil_image = Image.fromarray(squeezed_image)
+        # logging.info(f"[Job {job_id}] Exif in pil_image after fromarray: {pil_image.info.get('exif') is not None}") # DEBUG: Removed
 
-        # Create metadata
-        metadata = PngInfo()
-        metadata.add_text("prompt", prompt)
-        metadata.add_text("seed", str(seed))
-        # Add other relevant info if needed, e.g., job_id
-        metadata.add_text("job_id", job_id)
-
-        # Create unique filename using hex ID
-        filename = f"queue_image_{job_id}.png"
+        # Create unique filename using hex ID, change extension to jpg
+        filename = f"queue_image_{job_id}.jpg"
         filepath = os.path.join(temp_queue_images, filename)
 
-        # Save image with metadata
-        pil_image.save(filepath, pnginfo=metadata)
+        # Prepare save arguments
+        save_kwargs = {
+            "format": "JPEG",
+            "quality": 70,  # Lower quality for smaller file size
+        }
+        if exif_data:
+            save_kwargs["exif"] = exif_data
+            logging.info(f"[Job {job_id}] Attempting to save with Exif data.")
+        else:
+            logging.info(f"[Job {job_id}] No Exif data provided for saving.")
+
+        # Save image as JPEG with or without Exif
+        pil_image.save(filepath, **save_kwargs)
+        # logging.info(f"[Job {job_id}] Saved temp image to {filepath} (JPEG)") # DEBUG: Removed
         return filepath
     except Exception as e:
         print(f"Error saving image with metadata: {str(e)}")
@@ -204,16 +213,17 @@ def save_image_to_temp(image: np.ndarray, job_id: str, prompt: str, seed: int) -
         return ""
 
 
-def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_preservation, steps, cfg, gs, rs, status="pending", mp4_crf=16, lora_scale: float = 1.0, lora_path: Optional[str] = None):    # 追加: lora_path 引数
+def add_to_queue(prompt, image, original_exif: Optional[bytes], video_length, seed, use_teacache, gpu_memory_preservation, steps, cfg, gs, rs, status="pending", mp4_crf=16, lora_scale: float = 1.0, lora_path: Optional[str] = None):
     global job_queue
     try:
         # Generate a unique hex ID for the job
         job_id = uuid.uuid4().hex[:8]
         # Save image to temp directory and get path
         image_array = np.array(image)
-        image_path = save_image_to_temp(image_array, job_id, prompt, seed)  # Pass prompt and seed
+        # Pass original_exif to save_image_to_temp
+        image_path = save_image_to_temp(image_array, job_id, prompt, seed, exif_data=original_exif)
         if not image_path:
-            print("Failed to save image with metadata to temp, cannot add job.")
+            print("Failed to save image with Exif to temp, cannot add job.")
             return None
 
         job = QueuedJob(
@@ -231,7 +241,8 @@ def add_to_queue(prompt, image, video_length, seed, use_teacache, gpu_memory_pre
             status=status,
             mp4_crf=mp4_crf,
             lora_scale=lora_scale,
-            lora_path=lora_path       # 追加
+            lora_path=lora_path,
+            original_exif=original_exif  # Store exif in job object (won't be saved to JSON)
         )
         job_queue.append(job)
         if not save_queue():  # Save immediately after adding

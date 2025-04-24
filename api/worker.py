@@ -2,8 +2,9 @@ import os
 import torch
 import numpy as np
 from pathlib import Path  # 追加
+import logging  # 追加
 from PIL import Image  # Removed ImageDraw, ImageFont
-from PIL.PngImagePlugin import PngInfo
+# from PIL.PngImagePlugin import PngInfo # No longer needed for JPEG saving
 import traceback
 
 # Assuming models and tokenizers are loaded elsewhere and passed or accessed globally/via context
@@ -80,8 +81,9 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     use_teacache = job.use_teacache
     mp4_crf = job.mp4_crf
     job_id = job.job_id
-    lora_scale = job.lora_scale  # 追加: lora_scale をジョブから取得
-    lora_path = job.lora_path    # 追加: lora_path をジョブから取得
+    lora_scale = job.lora_scale
+    lora_path = job.lora_path
+    original_exif = job.original_exif  # Get Exif data from job object
 
     # Update job status to processing
     queue_manager.update_job_status(job_id, "processing")
@@ -118,8 +120,9 @@ def worker(job: queue_manager.QueuedJob, models: dict):
     try:
         # Load input image
         try:
-            input_image = Image.open(input_image_path)
-            input_image = np.array(input_image)
+            pil_input_image = Image.open(input_image_path)
+            # logging.info(f"[Job {job_id}] Exif in input_image after open: {pil_input_image.info.get('exif') is not None}") # DEBUG: Removed
+            input_image = np.array(pil_input_image)
         except FileNotFoundError:
             print(f"Error: Input image not found at {input_image_path}")
             queue_manager.update_job_status(job_id, "failed - image not found")
@@ -252,13 +255,26 @@ def worker(job: queue_manager.QueuedJob, models: dict):
         )
 
         # Save a copy of the processed input image (optional, but good for reference)
-        processed_input_image_path = os.path.join(outputs_folder, f"{job_id}_input.png")
-        metadata = PngInfo()
-        metadata.add_text("prompt", prompt)
-        metadata.add_text("seed", str(seed))
-        Image.fromarray(input_image_np).save(
-            processed_input_image_path, pnginfo=metadata
-        )
+        # Change filename to .jpg
+        processed_input_image_path = os.path.join(outputs_folder, f"{job_id}_input.jpg")
+        # Create PIL image from numpy array for saving
+        processed_pil_image = Image.fromarray(input_image_np)
+
+        # Prepare save arguments for JPEG with Exif
+        save_kwargs = {
+            "format": "JPEG",
+            "quality": 70,  # Lower quality for smaller file size
+        }
+        # Add exif data if it exists (retrieved from the job object)
+        if original_exif:
+            save_kwargs["exif"] = original_exif
+            logging.info(f"[Job {job_id}] Attempting to save processed input with Exif data.")
+        else:
+            logging.info(f"[Job {job_id}] No Exif data found in job object for processed input.")
+
+        # Save processed input image as JPEG with or without Exif
+        processed_pil_image.save(processed_input_image_path, **save_kwargs)
+        # logging.info(f"[Job {job_id}] Saved processed input image to {processed_input_image_path} (JPEG)") # DEBUG: Removed
 
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
