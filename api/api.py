@@ -23,7 +23,7 @@ from . import settings
 from . import models
 from . import queue_manager
 from . import worker
-from . import video_watcher  # 追加: Video Watcher module
+from . import video_watcher
 
 # --- Global State ---
 # Dictionary to hold loaded models
@@ -35,7 +35,7 @@ worker_thread = None
 currently_processing_job_id: str | None = None
 # --- Video Watcher State ---
 sse_clients: List[asyncio.Queue] = []  # List to hold client queues for SSE
-observer: Observer | None = None  # Watchdog observer instance
+observer: Observer | None = None  # type: ignore # Watchdog observer instance
 
 
 # --- Lifespan Context Manager ---

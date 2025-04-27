@@ -4,9 +4,9 @@ import traceback
 import uuid
 import numpy as np
 import logging
-from dataclasses import dataclass, field  # Import field
-from typing import Optional
-from datetime import datetime, timezone  # Import datetime and timezone
+from dataclasses import dataclass, field
+from typing import Optional, Dict
+from datetime import datetime, timezone
 from PIL import Image
 # from PIL.PngImagePlugin import PngInfo # No longer needed for JPEG saving
 
@@ -136,6 +136,9 @@ class QueuedJob:
 
 # Initialize job queue as a list
 job_queue = []
+
+# Dictionary to hold the latest preview image (Base64) for processing jobs (in-memory only)
+current_previews: Dict[str, str] = {}
 
 
 def save_queue():
@@ -416,12 +419,42 @@ def update_job_status(job_id: str, status: str, thumbnail: str = None):
         else:
             print(f"Job with ID {job_id} not found in memory or file for status update.")
 
+    # Clear preview if the job reached a terminal state
+    is_terminal = status == "completed" or status == "cancelled" or status.startswith("failed")
+    if is_terminal:
+        clear_current_preview(job_id)
+
     return job_updated
 
 
 # Configure logging (moved import to top)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+
+# --- Preview Data Management (In-Memory) ---
+
+def update_current_preview(job_id: str, preview_base64: str):
+    """Stores the latest preview image Base64 string for a job."""
+    global current_previews
+    current_previews[job_id] = preview_base64
+    # logging.debug(f"Updated preview for job {job_id}") # Optional: Debug logging
+
+
+def get_current_preview(job_id: str) -> Optional[str]:
+    """Retrieves the latest preview image Base64 string for a job."""
+    global current_previews
+    return current_previews.get(job_id)
+
+
+def clear_current_preview(job_id: str):
+    """Removes the preview image Base64 string for a job."""
+    global current_previews
+    if job_id in current_previews:
+        del current_previews[job_id]
+        logging.info(f"Cleared preview for job {job_id}")
+
+
+# --- Job Progress Update ---
 
 def update_job_progress(job_id: str, progress: float, step: int, total: int, info: str):
     """Updates the progress fields of a job in the global queue and saves the file."""
@@ -649,6 +682,8 @@ def cleanup_jobs_by_max_count(max_completed_jobs: int = settings.MAX_COMPLETED_J
                 files_to_delete.append(job.image_path)
             if job.thumbnail:
                 files_to_delete.append(job.thumbnail)
+            # Also clear any lingering preview data for the removed job
+            clear_current_preview(job.job_id)
             removed_count += 1
 
         # Combine kept terminal jobs and active jobs for the new queue
