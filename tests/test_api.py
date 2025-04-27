@@ -13,13 +13,16 @@ from api import queue_manager, settings  # settings をインポート
 # Assuming your FastAPI app instance is named 'app' in 'api/api.py'
 from api.api import app
 
-if torch.cuda.is_available():
-    gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
-else:
+try:
+    if torch.cuda.is_available():
+        gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
+    else:
+        gpu = torch.device('cpu')
+except Exception:
     gpu = torch.device('cpu')
 
 
-# Create a TestClient instance
+# Create a TestClien instance
 client = TestClient(app)
 
 
