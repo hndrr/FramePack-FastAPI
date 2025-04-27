@@ -17,6 +17,7 @@ peft
 
 fastapi
 uvicorn[standard]
+watchdog
 
 # Testing
 pytest

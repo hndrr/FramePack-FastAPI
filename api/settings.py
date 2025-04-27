@@ -27,6 +27,8 @@ TEMP_QUEUE_IMAGES_DIR = os.path.join(PROJECT_ROOT, 'temp_queue_images')
 QUEUE_FILE_PATH = os.path.join(PROJECT_ROOT, 'job_queue.json')
 HF_HOME_DIR = os.path.join(PROJECT_ROOT, 'hf_download')
 LORA_DIR = os.environ.get("LORA_DIR", os.path.join(PROJECT_ROOT, 'loras'))
+# Video Watcher Settings
+VIDEO_DIR = os.environ.get("VIDEO_DIR", OUTPUTS_DIR)  # Use OUTPUTS_DIR as default if env var not set
 
 
 # Ensure directories exist (These should ideally be created outside the API module if they don't exist)
@@ -34,6 +36,8 @@ os.makedirs(OUTPUTS_DIR, exist_ok=True)
 os.makedirs(TEMP_QUEUE_IMAGES_DIR, exist_ok=True)
 os.makedirs(HF_HOME_DIR, exist_ok=True)
 os.makedirs(LORA_DIR, exist_ok=True)
+# Ensure VIDEO_DIR exists (especially if it's different from OUTPUTS_DIR)
+os.makedirs(VIDEO_DIR, exist_ok=True)
 
 # Set Hugging Face home directory environment variable
 os.environ['HF_HOME'] = HF_HOME_DIR
@@ -55,6 +59,7 @@ print(f"  HF Home Dir: {HF_HOME_DIR}")
 print(f"  LoRA Dir: {LORA_DIR}")
 print(f"  Worker Check Interval: {WORKER_CHECK_INTERVAL}")
 print(f"  Allowed Origins: {ALLOWED_ORIGINS}")
+print(f"  Video Dir (for watcher): {VIDEO_DIR}")
 
 # --- Job Cleanup Settings ---
 # Maximum number of completed, cancelled, or failed jobs to keep in the queue file.

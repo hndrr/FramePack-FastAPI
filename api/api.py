@@ -7,6 +7,7 @@ import asyncio
 import json
 import base64  # 追加: Base64エンコード用
 import mimetypes  # 追加: MIMEタイプ判定用
+import logging  # 追加: Logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request  # Request を追加
 from fastapi.responses import FileResponse, StreamingResponse  # JSONResponse を削除
@@ -15,12 +16,14 @@ from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
 from typing import List, Optional  # Import Optional (Dict removed as unused)
+from watchdog.observers import Observer  # 追加: Watchdog Observer
 
 # Import modules created earlier (relative imports)
 from . import settings
 from . import models
 from . import queue_manager
 from . import worker
+from . import video_watcher  # 追加: Video Watcher module
 
 # --- Global State ---
 # Dictionary to hold loaded models
@@ -30,13 +33,16 @@ worker_running = False
 worker_thread = None
 # Variable to store the ID of the currently processing job
 currently_processing_job_id: str | None = None
+# --- Video Watcher State ---
+sse_clients: List[asyncio.Queue] = []  # List to hold client queues for SSE
+observer: Observer | None = None  # Watchdog observer instance
 
 
 # --- Lifespan Context Manager ---
 @asynccontextmanager  # Use the imported decorator directly
 async def lifespan(app: FastAPI):
     # Startup logic
-    global loaded_models, worker_running, worker_thread
+    global loaded_models, worker_running, worker_thread, observer, sse_clients  # Add observer and sse_clients
     print("API starting up via lifespan...")
     # Load models
     try:
@@ -60,10 +66,32 @@ async def lifespan(app: FastAPI):
     else:
         print("Worker already running? Skipping start in lifespan.")
 
+    # Start video watcher
+    try:
+        print(f"Attempting to start video watcher for directory: {settings.VIDEO_DIR}")
+        # Pass the global sse_clients list to the watcher
+        observer = video_watcher.start_watcher(settings.VIDEO_DIR, sse_clients)
+        print("Video watcher started successfully via lifespan.")
+    except Exception as e:
+        print(f"FATAL: Failed to start video watcher on startup: {e}")
+        traceback.print_exc()
+        observer = None  # Ensure observer is None if startup failed
+
     yield
 
     # Shutdown logic
     print("API shutting down via lifespan...")
+
+    # Stop video watcher first
+    if observer:
+        try:
+            print("Stopping video watcher...")
+            video_watcher.stop_watcher(observer)
+            print("Video watcher stopped.")
+        except Exception as e:
+            print(f"Error stopping video watcher: {e}")
+            traceback.print_exc()
+
     # Stop background worker
     if worker_running:
         worker_running = False
@@ -572,8 +600,93 @@ async def list_loras():
     return LoraListResponse(loras=lora_files)  # Correct indentation for return
 
 
+# === Video Streaming Endpoints ===
+
+@app.get("/video_stream")
+async def video_stream(request: Request):
+    """
+    Streams new video filenames using Server-Sent Events (SSE).
+    """
+    client_queue = asyncio.Queue()
+    sse_clients.append(client_queue)
+    logging.info(f"SSE client connected. Total clients: {len(sse_clients)}")
+
+    async def event_generator():
+        try:
+            while True:
+                # Check connection status first
+                if await request.is_disconnected():
+                    logging.info("SSE client disconnected.")
+                    break
+
+                try:
+                    # Wait for a new filename from the queue
+                    filename = await asyncio.wait_for(client_queue.get(), timeout=1.0)
+                    logging.info(f"Sending SSE data: {filename}")
+                    yield f"data: {filename}\n\n"
+                    client_queue.task_done()
+                except asyncio.TimeoutError:
+                    # No new file, continue loop to check connection status
+                    continue
+                except Exception as e:
+                    logging.error(f"Error in SSE generator: {e}")
+                    # Optionally send an error event to the client
+                    # yield f"event: error\ndata: {json.dumps({'message': 'Internal server error'})}\n\n"
+                    break  # Stop streaming on unexpected errors
+        finally:
+            # Cleanup when client disconnects or loop breaks
+            if client_queue in sse_clients:
+                sse_clients.remove(client_queue)
+            logging.info(f"SSE client queue removed. Total clients: {len(sse_clients)}")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.get("/videos/{filename}")
+async def get_video(filename: str):
+    """
+    Serves a specific video file from the VIDEO_DIR.
+    """
+    # Basic security check: prevent directory traversal
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    filepath = os.path.join(settings.VIDEO_DIR, filename)
+    logging.info(f"Request for video file: {filepath}")
+
+    if not os.path.exists(filepath) or not os.path.isfile(filepath):
+        logging.warning(f"Video file not found: {filepath}")
+        raise HTTPException(status_code=404, detail="Video file not found")
+
+    # Check if the file is an mp4 file (optional but recommended)
+    if not filename.lower().endswith(".mp4"):
+        raise HTTPException(status_code=400, detail="Invalid file type, only MP4 is supported.")
+
+    return FileResponse(filepath, media_type="video/mp4", filename=filename)
+
+
+@app.get("/videos", response_model=List[str])
+async def list_videos():
+    """
+    Lists all .mp4 files currently in the VIDEO_DIR.
+    """
+    try:
+        all_files = os.listdir(settings.VIDEO_DIR)
+        mp4_files = sorted([f for f in all_files if f.lower().endswith(".mp4") and os.path.isfile(os.path.join(settings.VIDEO_DIR, f))])
+        logging.info(f"Found {len(mp4_files)} MP4 files in {settings.VIDEO_DIR}")
+        return mp4_files
+    except FileNotFoundError:
+        logging.error(f"VIDEO_DIR not found: {settings.VIDEO_DIR}")
+        raise HTTPException(status_code=500, detail="Video directory not found on server.")
+    except Exception as e:
+        logging.error(f"Error listing videos in {settings.VIDEO_DIR}: {e}")
+        raise HTTPException(status_code=500, detail="Error listing video files.")
+
+
 # --- Main execution (for running with uvicorn) ---
 if __name__ == "__main__":
     import uvicorn
+    # Configure logging for the main execution context as well
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     print(f"Starting Uvicorn server on {settings.API_HOST}:{settings.API_PORT}")
-    uvicorn.run(app, host=settings.API_HOST, port=settings.API_PORT)
+    uvicorn.run("api.api:app", host=settings.API_HOST, port=settings.API_PORT, reload=True)  # Use string import for reload
