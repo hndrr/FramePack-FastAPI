@@ -82,7 +82,6 @@ def get_cuda_free_memory_gb(device=None):
     if not torch.cuda.is_available():
         return 0  # GPUが無い場合は0を返す
 
-
     try:
         memory_stats = torch.cuda.memory_stats(device)
         bytes_active = memory_stats.get('active_bytes.all.current')
