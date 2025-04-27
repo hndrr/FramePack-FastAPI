@@ -591,13 +591,13 @@ class HunyuanVideoSingleTransformerBlock(nn.Module):
 
         # 3. Modulation and residual connection
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
-        print(f"DEBUG: Before proj_out - hidden_states device: {hidden_states.device}")
-        print(f"DEBUG: Before proj_out - gate device: {gate.device}")
+        # print(f"DEBUG: Before proj_out - hidden_states device: {hidden_states.device}")
+        # print(f"DEBUG: Before proj_out - gate device: {gate.device}")
         # Check proj_out layer's device (assuming it's a nn.Module with parameters)
         proj_out_device = next(self.proj_out.parameters()).device if list(self.proj_out.parameters()) else "No parameters"
-        print(f"DEBUG: Before proj_out - self.proj_out device: {proj_out_device}")
+        # print(f"DEBUG: Before proj_out - self.proj_out device: {proj_out_device}")
         proj_out_result = self.proj_out(hidden_states)
-        print(f"DEBUG: After proj_out - proj_out_result device: {proj_out_result.device}")
+        # print(f"DEBUG: After proj_out - proj_out_result device: {proj_out_result.device}")
         hidden_states = gate * proj_out_result # Error likely occurs here
         hidden_states = hidden_states + residual
 
