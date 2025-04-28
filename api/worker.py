@@ -6,6 +6,9 @@ import logging  # 追加
 from PIL import Image  # Removed ImageDraw, ImageFont
 # from PIL.PngImagePlugin import PngInfo # No longer needed for JPEG saving
 import traceback
+import base64  # Add base64
+import io      # Add io
+import einops  # Add einops
 
 # Assuming models and tokenizers are loaded elsewhere and passed or accessed globally/via context
 # This will be refined when creating models.py and integrating
@@ -16,6 +19,7 @@ from diffusers_helper.hunyuan import (
     encode_prompt_conds,
     vae_decode,
     vae_encode,
+    vae_decode_fake,  # Add vae_decode_fake
 )
 
 from diffusers_helper.utils import (
@@ -416,6 +420,7 @@ def worker(job: queue_manager.QueuedJob, models: dict):
 
             # K-Diffusion Sampling Callback
             def callback(d):
+                # --- Progress Update ---
                 current_cb_step = d['i'] + 1  # 1-based step for the current section
                 total_cb_steps = steps  # Total steps for this section
 
@@ -437,7 +442,38 @@ def worker(job: queue_manager.QueuedJob, models: dict):
                     info=hint
                 )
 
-                # Check for cancellation signal within callback
+                # --- Preview Generation ---
+                try:
+                    # Only generate preview every N steps or on the last step to reduce overhead
+                    if current_cb_step % 2 == 0 or current_cb_step == total_cb_steps:
+                        preview_latent = d['denoised']
+                        preview_tensor = vae_decode_fake(preview_latent)  # Use vae_decode_fake
+
+                        # Convert tensor to PIL Image
+                        preview_np = (preview_tensor * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                        # Rearrange: b c t h w -> (b h) (t w) c (assuming single batch)
+                        # vae_decode_fake likely returns B C T H W, where T might be > 1
+                        preview_np_rearranged = einops.rearrange(preview_np, 'b c t h w -> (b h) (t w) c')
+
+                        preview_image = Image.fromarray(preview_np_rearranged)
+
+                        # Save image to buffer as JPEG
+                        buffer = io.BytesIO()
+                        preview_image.save(buffer, format="JPEG", quality=75)  # Adjust quality as needed
+                        buffer.seek(0)
+
+                        # Encode to Base64
+                        preview_base64_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                        preview_base64_string = f"data:image/jpeg;base64,{preview_base64_data}"
+
+                        # Update preview in queue_manager (in-memory)
+                        queue_manager.update_current_preview(job_id, preview_base64_string)
+                        # logging.debug(f"Job {job_id}: Updated preview at step {current_cb_step}")  # Optional debug log
+                except Exception as preview_e:
+                    # Log error but don't necessarily stop the whole process
+                    logging.warning(f"Job {job_id}: Error generating preview at step {current_cb_step}: {preview_e}")
+
+                # --- Cancellation Check ---
                 current_job_status_inner = queue_manager.get_job_by_id(job_id)  # Use the function that reads the file
                 if current_job_status_inner and current_job_status_inner.status == "cancelled":
                     # Use current_cb_step which is defined in this scope
@@ -561,6 +597,8 @@ def worker(job: queue_manager.QueuedJob, models: dict):
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
+        # Clear preview data from memory
+        queue_manager.clear_current_preview(job_id)
         print(f"Worker finished for job {job_id}")
 
 
