@@ -44,6 +44,9 @@ class QueuedJob:
     progress_info: str = ""
     lora_scale: float = 1.0  # 追加: LoRA強度
     lora_path: Optional[str] = None
+    # Add sampling mode and transformer model selection
+    sampling_mode: str = "reverse"  # "reverse" or "forward"
+    transformer_model: str = "base"  # "base" or "f1"
     # Add updated_at timestamp, default to current UTC time
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # Add field for original Exif data (bytes) - will not be saved in JSON
@@ -76,6 +79,8 @@ class QueuedJob:
                 'progress_info': self.progress_info,
                 'lora_scale': self.lora_scale,  # 追加
                 'lora_path': self.lora_path,
+                'sampling_mode': self.sampling_mode,  # Add sampling_mode
+                'transformer_model': self.transformer_model,  # Add transformer_model
                 'updated_at': updated_at_iso,  # Add updated_at
             }
         except Exception as e:
@@ -126,6 +131,8 @@ class QueuedJob:
                 progress_info=data.get('progress_info', ''),
                 lora_scale=data.get('lora_scale', 1.0),   # 追加
                 lora_path=data.get('lora_path', None),
+                sampling_mode=data.get('sampling_mode', 'reverse'),  # Add sampling_mode with default
+                transformer_model=data.get('transformer_model', 'base'),  # Add transformer_model with default
                 updated_at=updated_at_dt  # Add updated_at
             )
         except Exception as e:
@@ -216,7 +223,7 @@ def save_image_to_temp(image: np.ndarray, job_id: str, prompt: str, seed: int, e
         return ""
 
 
-def add_to_queue(prompt, image, original_exif: Optional[bytes], video_length, seed, use_teacache, gpu_memory_preservation, steps, cfg, gs, rs, status="pending", mp4_crf=16, lora_scale: float = 1.0, lora_path: Optional[str] = None):
+def add_to_queue(prompt, image, original_exif: Optional[bytes], video_length, seed, use_teacache, gpu_memory_preservation, steps, cfg, gs, rs, status="pending", mp4_crf=16, lora_scale: float = 1.0, lora_path: Optional[str] = None, sampling_mode: str = "reverse", transformer_model: str = "base"):
     global job_queue
     try:
         # Generate a unique hex ID for the job
@@ -245,6 +252,8 @@ def add_to_queue(prompt, image, original_exif: Optional[bytes], video_length, se
             mp4_crf=mp4_crf,
             lora_scale=lora_scale,
             lora_path=lora_path,
+            sampling_mode=sampling_mode,  # Add sampling_mode
+            transformer_model=transformer_model,  # Add transformer_model
             original_exif=original_exif  # Store exif in job object (won't be saved to JSON)
         )
         job_queue.append(job)
