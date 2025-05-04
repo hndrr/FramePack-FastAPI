@@ -233,7 +233,6 @@ async def generate_video(
     lora_scale: float = Form(1.0),
     lora_path: Optional[str] = Form(None, description="Path to the LoRA file to use for this request (overrides server default if provided)."),
     sampling_mode: str = Form("reverse", description="Sampling loop direction ('reverse' or 'forward')."),
-    transformer_model: str = Form("base", description="Transformer model to use ('base' or 'f1')."),
     image: UploadFile = File(...)
 ):
     """
@@ -260,6 +259,18 @@ async def generate_video(
     finally:
         await image.close()
 
+    # Determine the transformer model based on sampling_mode
+    if sampling_mode == "forward":
+        actual_transformer_model = "f1"
+    elif sampling_mode == "reverse":
+        actual_transformer_model = "base"
+    else:
+        # Handle unexpected sampling_mode, perhaps default to 'base' or raise error
+        print(f"Warning: Unexpected sampling_mode '{sampling_mode}'. Defaulting transformer_model to 'base'.")
+        actual_transformer_model = "base"
+        # Alternatively, raise HTTPException:
+        # raise HTTPException(status_code=400, detail=f"Invalid sampling_mode: {sampling_mode}. Must be 'reverse' or 'forward'.")
+
     # Add job to the queue using queue_manager
     try:
         job_id = queue_manager.add_to_queue(
@@ -278,7 +289,7 @@ async def generate_video(
             lora_scale=lora_scale,
             lora_path=lora_path,
             sampling_mode=sampling_mode,
-            transformer_model=transformer_model,
+            transformer_model=actual_transformer_model, # Use the determined model
             status="pending"
         )
     except Exception as e:
