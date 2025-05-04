@@ -8,6 +8,7 @@ import json
 import base64
 import mimetypes
 import logging
+import enum
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -177,6 +178,12 @@ class ResultResponse(BaseModel):
     thumbnail_base64: Optional[str] = None
 
 
+# --- Enum for Sampling Mode ---
+class SamplingMode(str, enum.Enum):
+    reverse = "reverse"
+    forward = "forward"
+
+
 # --- Background Worker ---
 def background_worker_task():
     global worker_running, currently_processing_job_id
@@ -232,7 +239,7 @@ async def generate_video(
     mp4_crf: float = Form(16.0),
     lora_scale: float = Form(1.0),
     lora_path: Optional[str] = Form(None, description="Path to the LoRA file to use for this request (overrides server default if provided)."),
-    sampling_mode: str = Form("reverse", description="Sampling loop direction ('reverse' or 'forward')."),
+    sampling_mode: SamplingMode = Form(SamplingMode.reverse, description="Sampling loop direction."),
     image: UploadFile = File(...)
 ):
     """
@@ -260,16 +267,16 @@ async def generate_video(
         await image.close()
 
     # Determine the transformer model based on sampling_mode
-    if sampling_mode == "forward":
+    # Use sampling_mode.value to get the string value from the Enum
+    if sampling_mode == SamplingMode.forward:
         actual_transformer_model = "f1"
-    elif sampling_mode == "reverse":
+    elif sampling_mode == SamplingMode.reverse:
         actual_transformer_model = "base"
     else:
-        # Handle unexpected sampling_mode, perhaps default to 'base' or raise error
-        print(f"Warning: Unexpected sampling_mode '{sampling_mode}'. Defaulting transformer_model to 'base'.")
+        # This 'else' block might be unreachable if using Enum correctly,
+        # but kept for safety or future expansion. FastAPI handles invalid Enum values.
+        print(f"Warning: Unexpected sampling_mode '{sampling_mode.value}'. Defaulting transformer_model to 'base'.")
         actual_transformer_model = "base"
-        # Alternatively, raise HTTPException:
-        # raise HTTPException(status_code=400, detail=f"Invalid sampling_mode: {sampling_mode}. Must be 'reverse' or 'forward'.")
 
     # Add job to the queue using queue_manager
     try:
@@ -288,8 +295,8 @@ async def generate_video(
             mp4_crf=mp4_crf,
             lora_scale=lora_scale,
             lora_path=lora_path,
-            sampling_mode=sampling_mode,
-            transformer_model=actual_transformer_model, # Use the determined model
+            sampling_mode=sampling_mode.value,
+            transformer_model=actual_transformer_model,
             status="pending"
         )
     except Exception as e:
