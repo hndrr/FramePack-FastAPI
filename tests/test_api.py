@@ -8,7 +8,7 @@ import base64
 # import asyncio # Not directly used when only AsyncMock is needed
 from unittest.mock import mock_open
 from PIL import Image
-from api import queue_manager, settings  # settings をインポート
+from api import queue_manager, settings
 
 # Assuming your FastAPI app instance is named 'app' in 'api/api.py'
 from api.api import app
@@ -139,6 +139,10 @@ def test_generate_job_success(mocker, lora_path_param, lora_scale_param, expecte
     assert response_json["message"] == "Video generation job added to queue."
 
     # Verify that add_to_queue was called with the correct arguments
+    # Determine expected transformer model based on sampling mode (default is reverse -> base)
+    # In a real scenario with parameterized sampling_mode, this would need adjustment.
+    expected_transformer_model = "base"
+
     mock_add_to_queue.assert_called_once_with(
         prompt=data["prompt"],
         image=mocker.ANY,
@@ -154,6 +158,8 @@ def test_generate_job_success(mocker, lora_path_param, lora_scale_param, expecte
         mp4_crf=data["mp4_crf"],
         lora_scale=expected_lora_scale_in_queue,
         lora_path=expected_lora_path_in_queue,
+        sampling_mode="reverse",
+        transformer_model=expected_transformer_model,
         status="pending"
     )
 
