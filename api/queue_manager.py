@@ -5,7 +5,7 @@ import uuid
 import numpy as np
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 from PIL import Image
 # from PIL.PngImagePlugin import PngInfo # No longer needed for JPEG saving
@@ -51,6 +51,12 @@ class QueuedJob:
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # Add field for original Exif data (bytes) - will not be saved in JSON
     original_exif: Optional[bytes] = field(default=None, repr=False)
+    # Add job type field
+    job_type: str = "video"  # "video", "image", "batch_image", "image_transfer"
+    # Add generic data field for different job types
+    data: Optional[Dict[str, Any]] = None
+    # Add result field for completed jobs
+    result: Optional[Dict[str, Any]] = None
 
     def to_dict(self):
         # Exclude original_exif from the dictionary saved to JSON
@@ -82,6 +88,9 @@ class QueuedJob:
                 'sampling_mode': self.sampling_mode,  # Add sampling_mode
                 'transformer_model': self.transformer_model,  # Add transformer_model
                 'updated_at': updated_at_iso,  # Add updated_at
+                'job_type': self.job_type,  # Add job_type
+                'data': self.data,  # Add data
+                'result': self.result,  # Add result
             }
         except Exception as e:
             print(f"Error converting job to dict: {str(e)}")
@@ -133,7 +142,10 @@ class QueuedJob:
                 lora_path=data.get('lora_path', None),
                 sampling_mode=data.get('sampling_mode', 'reverse'),  # Add sampling_mode with default
                 transformer_model=data.get('transformer_model', 'base'),  # Add transformer_model with default
-                updated_at=updated_at_dt  # Add updated_at
+                updated_at=updated_at_dt,  # Add updated_at
+                job_type=data.get('job_type', 'video'),  # Add job_type with default
+                data=data.get('data', None),  # Add data
+                result=data.get('result', None),  # Add result
             )
         except Exception as e:
             print(f"Error creating job from dict: {str(e)}")
@@ -267,6 +279,78 @@ def add_to_queue(prompt, image, original_exif: Optional[bytes], video_length, se
         print(f"Error adding job to queue: {str(e)}")
         traceback.print_exc()
         return None
+
+
+def add_job(job_id: str, job_data: Dict[str, Any]):
+    """Add a generic job to the queue"""
+    global job_queue
+    try:
+        job = QueuedJob(
+            prompt=job_data.get("data", {}).get("prompt", ""),
+            image_path="",  # Will be filled for video jobs
+            video_length=0.0,  # Will be filled for video jobs
+            job_id=job_id,
+            seed=job_data.get("data", {}).get("seed", -1),
+            use_teacache=job_data.get("data", {}).get("use_teacache", False),
+            gpu_memory_preservation=job_data.get("data", {}).get("gpu_memory_preservation", 0.0),
+            steps=job_data.get("data", {}).get("steps", 30),
+            cfg=job_data.get("data", {}).get("cfg", 1.0),
+            gs=job_data.get("data", {}).get("gs", 1.0),
+            rs=job_data.get("data", {}).get("rs", 1.0),
+            status="pending",
+            job_type=job_data.get("type", "image"),
+            data=job_data.get("data", {}),
+            updated_at=datetime.now(timezone.utc)
+        )
+        job_queue.append(job)
+        if not save_queue():
+            print(f"Failed to save queue after adding job {job_id}")
+            job_queue.pop()
+            return False
+        return True
+    except Exception as e:
+        print(f"Error adding job {job_id} to queue: {str(e)}")
+        traceback.print_exc()
+        return False
+
+
+def update_job_result(job_id: str, result: Dict[str, Any]):
+    """Update the result field of a job"""
+    global job_queue
+    job_updated = False
+    
+    # Try to update in memory first
+    for job in job_queue:
+        if job.job_id == job_id:
+            job.result = result
+            job.updated_at = datetime.now(timezone.utc)
+            job_updated = True
+            break
+    
+    if job_updated:
+        save_queue()
+    else:
+        # Try loading from file and updating
+        current_queue = load_queue_from_file()
+        for job in current_queue:
+            if job.job_id == job_id:
+                job.result = result
+                job.updated_at = datetime.now(timezone.utc)
+                job_updated = True
+                break
+        
+        if job_updated:
+            try:
+                jobs_to_save = [j.to_dict() for j in current_queue if j.to_dict() is not None]
+                with open(QUEUE_FILE, 'w') as f:
+                    json.dump(jobs_to_save, f, indent=2)
+                job_queue = current_queue
+            except Exception as e:
+                print(f"Error saving queue after updating result for job {job_id}: {e}")
+                traceback.print_exc()
+                job_updated = False
+    
+    return job_updated
 
 
 # Removed redundant traceback import
@@ -575,6 +659,7 @@ def get_queue_status():
             # Include progress in status summary
             "progress": job.progress,
             "progress_info": job.progress_info,
+            "job_type": job.job_type,  # Include job type
         })
     return status_list
 
