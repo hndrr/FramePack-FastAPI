@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
 from typing import List, Optional
+from datetime import datetime
+import uuid
 from watchdog.observers import Observer
 
 # Import modules created earlier (relative imports)
@@ -25,6 +27,7 @@ from . import models
 from . import queue_manager
 from . import worker
 from . import video_watcher
+from . import worker_image
 
 # --- Global State ---
 # Dictionary to hold loaded models
@@ -45,17 +48,21 @@ async def lifespan(app: FastAPI):
     # Startup logic
     global loaded_models, worker_running, worker_thread, observer, sse_clients
     print("API starting up via lifespan...")
-    # Load models
-    try:
-        # Consider running blocking IO in a threadpool executor in async context
-        # e.g., await asyncio.to_thread(models.load_models)
-        # For simplicity now, keeping the direct call but be aware of potential blocking
-        loaded_models = models.load_models()
-        print("Models loaded successfully via lifespan.")
-    except Exception as e:
-        print(f"FATAL: Failed to load models on startup via lifespan: {e}")
-        traceback.print_exc()
+    # Load models (skip if in development mode)
+    if os.getenv("MODELS_DISABLED", "false").lower() == "true":
+        print("Models loading disabled - running in development mode")
         loaded_models = {}
+    else:
+        try:
+            # Consider running blocking IO in a threadpool executor in async context
+            # e.g., await asyncio.to_thread(models.load_models)
+            # For simplicity now, keeping the direct call but be aware of potential blocking
+            loaded_models = models.load_models()
+            print("Models loaded successfully via lifespan.")
+        except Exception as e:
+            print(f"FATAL: Failed to load models on startup via lifespan: {e}")
+            traceback.print_exc()
+            loaded_models = {}
 
     # Start background worker
     if not worker_running:
@@ -176,6 +183,48 @@ class LoraListResponse(BaseModel):
 class ResultResponse(BaseModel):
     video_url: str
     thumbnail_base64: Optional[str] = None
+
+
+# --- Image Generation Models ---
+class ImageGenerationRequest(BaseModel):
+    prompt: str = Field(..., description="Text prompt for image generation.")
+    negative_prompt: Optional[str] = Field("", description="Negative prompt.")
+    seed: Optional[int] = Field(-1, description="Seed for generation. -1 for random.")
+    steps: int = Field(30, description="Number of diffusion steps.", gt=0)
+    cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
+    width: int = Field(1216, description="Image width.", gt=0)
+    height: int = Field(704, description="Image height.", gt=0)
+    lora_paths: Optional[List[str]] = Field(None, description="List of LoRA file paths.")
+    lora_scales: Optional[List[float]] = Field(None, description="List of LoRA scales.")
+
+
+class BatchImageRequest(BaseModel):
+    prompts: List[str] = Field(..., description="List of text prompts for batch generation.")
+    negative_prompt: Optional[str] = Field("", description="Negative prompt for all images.")
+    seeds: Optional[List[int]] = Field(None, description="List of seeds (one per prompt).")
+    batch_size: int = Field(4, description="Number of images to generate in parallel.", gt=0, le=8)
+    steps: int = Field(30, description="Number of diffusion steps.", gt=0)
+    cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
+    width: int = Field(1216, description="Image width.", gt=0)
+    height: int = Field(704, description="Image height.", gt=0)
+    lora_paths: Optional[List[str]] = Field(None, description="List of LoRA file paths.")
+    lora_scales: Optional[List[float]] = Field(None, description="List of LoRA scales.")
+
+
+class ImageTransferRequest(BaseModel):
+    source_image: str = Field(..., description="Base64 encoded source image.")
+    target_image: str = Field(..., description="Base64 encoded target image.")
+    prompt: str = Field(..., description="Text prompt for the transfer.")
+    negative_prompt: Optional[str] = Field("", description="Negative prompt.")
+    transfer_strength: float = Field(0.7, description="Strength of the style transfer.", ge=0.0, le=1.0)
+    seed: Optional[int] = Field(-1, description="Seed for generation. -1 for random.")
+    steps: int = Field(30, description="Number of diffusion steps.", gt=0)
+    cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
+
+
+class ImageGenerationResponse(BaseModel):
+    job_id: str
+    message: str
 
 
 # --- Enum for Sampling Mode ---
@@ -703,6 +752,134 @@ async def list_videos():
     except Exception as e:
         logging.error(f"Error listing videos in {settings.VIDEO_DIR}: {e}")
         raise HTTPException(status_code=500, detail="Error listing video files.")
+
+
+# --- Image Generation Endpoints ---
+
+@app.post("/api/generate-image", response_model=ImageGenerationResponse)
+async def generate_image(request: ImageGenerationRequest):
+    """
+    Generate a single high-quality image from a text prompt.
+    """
+    if not loaded_models:
+        raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
+    
+    # Create a unique job ID
+    import uuid
+    job_id = str(uuid.uuid4())
+    
+    # Prepare job data
+    job_data = {
+        "type": "image",
+        "data": request.dict(),
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Add to queue
+    try:
+        queue_manager.add_job(job_id, job_data)
+        print(f"Image generation job added to queue: {job_id}")
+    except Exception as e:
+        print(f"Error adding image job to queue: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
+    
+    # Start processing in background
+    asyncio.create_task(worker_image.process_image_generation(job_id, job_data, loaded_models))
+    
+    return ImageGenerationResponse(
+        job_id=job_id,
+        message="Image generation job added to queue."
+    )
+
+
+@app.post("/api/batch-images", response_model=ImageGenerationResponse)
+async def batch_images(request: BatchImageRequest):
+    """
+    Generate multiple images in batch from a list of prompts.
+    """
+    if not loaded_models:
+        raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
+    
+    # Create a unique job ID
+    import uuid
+    job_id = str(uuid.uuid4())
+    
+    # Prepare job data
+    job_data = {
+        "type": "batch_image",
+        "data": request.dict(),
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Add to queue
+    try:
+        queue_manager.add_job(job_id, job_data)
+        print(f"Batch image generation job added to queue: {job_id}")
+    except Exception as e:
+        print(f"Error adding batch image job to queue: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
+    
+    # Start processing in background
+    asyncio.create_task(worker_image.process_batch_images(job_id, job_data, loaded_models))
+    
+    return ImageGenerationResponse(
+        job_id=job_id,
+        message="Batch image generation job added to queue."
+    )
+
+
+@app.post("/api/transfer-image", response_model=ImageGenerationResponse)
+async def transfer_image(request: ImageTransferRequest):
+    """
+    Transfer style from source image to target image (kisekaeichi functionality).
+    """
+    if not loaded_models:
+        raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
+    
+    # Create a unique job ID
+    import uuid
+    job_id = str(uuid.uuid4())
+    
+    # Prepare job data
+    job_data = {
+        "type": "image_transfer",
+        "data": request.dict(),
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Add to queue
+    try:
+        queue_manager.add_job(job_id, job_data)
+        print(f"Image transfer job added to queue: {job_id}")
+    except Exception as e:
+        print(f"Error adding image transfer job to queue: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
+    
+    # Start processing in background
+    asyncio.create_task(worker_image.process_image_transfer(job_id, job_data, loaded_models))
+    
+    return ImageGenerationResponse(
+        job_id=job_id,
+        message="Image transfer job added to queue."
+    )
+
+
+@app.get("/api/image/{job_id}")
+async def get_generated_image(job_id: str):
+    """
+    Download the generated image file.
+    """
+    # Check job status first
+    job = queue_manager.get_job_by_id(job_id)
+    if job and job.status != "completed":
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' is not completed yet (status: {job.status}).")
+    
+    # Check for image file
+    image_path = os.path.join("outputs/images", f"{job_id}.png")
+    if os.path.exists(image_path):
+        return FileResponse(image_path, media_type="image/png", filename=f"{job_id}.png")
+    else:
+        raise HTTPException(status_code=404, detail=f"Image file for job '{job_id}' not found.")
 
 
 # --- Main execution (for running with uvicorn) ---
