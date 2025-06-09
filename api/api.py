@@ -144,7 +144,7 @@ class GenerateRequest(BaseModel):
     video_length: float = Field(5.0, description="Length of the video in seconds.", gt=0)
     seed: int = Field(-1, description="Seed for generation. -1 for random.")
     use_teacache: bool = Field(False, description="Enable TEACache optimization.")
-    gpu_memory_preservation: float = Field(0.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
+    gpu_memory_preservation: float = Field(10.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
     steps: int = Field(20, description="Number of diffusion steps.", gt=0)
     cfg: float = Field(7.0, description="Classifier-Free Guidance scale.", ge=1.0)
     gs: float = Field(1.0, description="Guidance scale for start latent.", ge=0)
@@ -189,17 +189,20 @@ class ResultResponse(BaseModel):
 class ImageGenerationRequest(BaseModel):
     prompt: str = Field(..., description="Text prompt for image generation.")
     negative_prompt: Optional[str] = Field("", description="Negative prompt.")
+    input_image: str = Field(..., description="Base64 encoded input image (required).")
     seed: Optional[int] = Field(-1, description="Seed for generation. -1 for random.")
     steps: int = Field(30, description="Number of diffusion steps.", gt=0)
     cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
     width: int = Field(1216, description="Image width.", gt=0)
     height: int = Field(704, description="Image height.", gt=0)
+    gpu_memory_preservation: float = Field(10.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
     lora_paths: Optional[List[str]] = Field(None, description="List of LoRA file paths.")
     lora_scales: Optional[List[float]] = Field(None, description="List of LoRA scales.")
 
 
 class BatchImageRequest(BaseModel):
     prompts: List[str] = Field(..., description="List of text prompts for batch generation.")
+    input_image: str = Field(..., description="Base64 encoded input image (used for all batch items).")
     negative_prompt: Optional[str] = Field("", description="Negative prompt for all images.")
     seeds: Optional[List[int]] = Field(None, description="List of seeds (one per prompt).")
     batch_size: int = Field(4, description="Number of images to generate in parallel.", gt=0, le=8)
@@ -207,6 +210,7 @@ class BatchImageRequest(BaseModel):
     cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
     width: int = Field(1216, description="Image width.", gt=0)
     height: int = Field(704, description="Image height.", gt=0)
+    gpu_memory_preservation: float = Field(10.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
     lora_paths: Optional[List[str]] = Field(None, description="List of LoRA file paths.")
     lora_scales: Optional[List[float]] = Field(None, description="List of LoRA scales.")
 
@@ -220,6 +224,7 @@ class ImageTransferRequest(BaseModel):
     seed: Optional[int] = Field(-1, description="Seed for generation. -1 for random.")
     steps: int = Field(30, description="Number of diffusion steps.", gt=0)
     cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
+    gpu_memory_preservation: float = Field(10.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
 
 
 class ImageGenerationResponse(BaseModel):
@@ -231,6 +236,12 @@ class ImageGenerationResponse(BaseModel):
 class SamplingMode(str, enum.Enum):
     reverse = "reverse"
     forward = "forward"
+
+
+# --- Enum for Output Type ---
+class OutputType(str, enum.Enum):
+    video = "video"
+    image = "image"
 
 
 # --- Background Worker ---
@@ -757,12 +768,36 @@ async def list_videos():
 # --- Image Generation Endpoints ---
 
 @app.post("/api/generate-image", response_model=ImageGenerationResponse)
-async def generate_image(request: ImageGenerationRequest):
+async def generate_image(
+    prompt: str = Form(..., description="Text prompt for image generation."),
+    negative_prompt: str = Form("", description="Negative prompt."),
+    seed: int = Form(-1, description="Seed for generation. -1 for random."),
+    steps: int = Form(30, description="Number of diffusion steps."),
+    cfg: float = Form(1.0, description="Classifier-Free Guidance scale."),
+    width: int = Form(1216, description="Image width."),
+    height: int = Form(704, description="Image height."),
+    lora_path: Optional[str] = Form("", description="LoRA file path."),
+    lora_scale: float = Form(1.0, description="LoRA scale."),
+    gpu_memory_preservation: float = Form(10.0, description="GPU memory to preserve (GB) in low VRAM mode."),
+    sampling_mode: str = Form("dpm-solver++", description="Sampling mode."),
+    transformer_model: str = Form("base", description="Transformer model (base or f1)."),
+    input_image: UploadFile = File(..., description="Input image file (required).")
+):
     """
-    Generate a single high-quality image from a text prompt.
+    Generate a single high-quality image from input image and text prompt (Image-to-Image).
     """
     if not loaded_models:
         raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
+    
+    # Read and encode input image
+    try:
+        contents = await input_image.read()
+        import base64
+        input_image_b64 = base64.b64encode(contents).decode('utf-8')
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read input image: {e}")
+    finally:
+        await input_image.close()
     
     # Create a unique job ID
     import uuid
@@ -771,7 +806,21 @@ async def generate_image(request: ImageGenerationRequest):
     # Prepare job data
     job_data = {
         "type": "image",
-        "data": request.dict(),
+        "data": {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "input_image": input_image_b64,
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "width": width,
+            "height": height,
+            "lora_path": lora_path,
+            "lora_scale": lora_scale,
+            "gpu_memory_preservation": gpu_memory_preservation,
+            "sampling_mode": sampling_mode,
+            "transformer_model": transformer_model
+        },
         "created_at": datetime.now().isoformat()
     }
     
@@ -784,7 +833,11 @@ async def generate_image(request: ImageGenerationRequest):
         raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
     
     # Start processing in background
-    asyncio.create_task(worker_image.process_image_generation(job_id, job_data, loaded_models))
+    threading.Thread(
+        target=worker_image.process_image_generation,
+        args=(job_id, job_data, loaded_models),
+        daemon=True
+    ).start()
     
     return ImageGenerationResponse(
         job_id=job_id,
@@ -820,7 +873,11 @@ async def batch_images(request: BatchImageRequest):
         raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
     
     # Start processing in background
-    asyncio.create_task(worker_image.process_batch_images(job_id, job_data, loaded_models))
+    threading.Thread(
+        target=worker_image.process_batch_images,
+        args=(job_id, job_data, loaded_models),
+        daemon=True
+    ).start()
     
     return ImageGenerationResponse(
         job_id=job_id,
@@ -856,7 +913,11 @@ async def transfer_image(request: ImageTransferRequest):
         raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
     
     # Start processing in background
-    asyncio.create_task(worker_image.process_image_transfer(job_id, job_data, loaded_models))
+    threading.Thread(
+        target=worker_image.process_image_transfer,
+        args=(job_id, job_data, loaded_models),
+        daemon=True
+    ).start()
     
     return ImageGenerationResponse(
         job_id=job_id,
