@@ -1,7 +1,8 @@
 """
 Image generation specific models and configurations
+Enhanced with performance optimization utilities
 """
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
 import torch
 
 # Image generation configuration
@@ -14,6 +15,8 @@ IMAGE_GENERATION_CONFIG = {
     "vae_scale_factor": 8,
     "time_scale_factor": 4,
     "transformer_embed_dim": 3072,
+    "text_encoding_cache_size": 50,  # Max cached text encodings
+    "memory_cleanup_threshold": 0.9,  # GPU memory threshold for cleanup
 }
 
 
@@ -97,6 +100,55 @@ def validate_image_dimensions(width: int, height: int) -> Tuple[int, int]:
     return adjusted_width, adjusted_height
 
 
+def check_gpu_memory() -> Dict[str, float]:
+    """
+    Check current GPU memory usage
+    
+    Returns:
+        Dictionary with memory statistics in GB
+    """
+    if not torch.cuda.is_available():
+        return {
+            "allocated": 0.0,
+            "reserved": 0.0,
+            "free": 0.0,
+            "total": 0.0
+        }
+    
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    free = total - allocated
+    
+    return {
+        "allocated": allocated,
+        "reserved": reserved,
+        "free": free,
+        "total": total
+    }
+
+
+def should_cleanup_memory(threshold: float = None) -> bool:
+    """
+    Check if memory cleanup is needed based on usage threshold
+    
+    Args:
+        threshold: Memory usage threshold (0-1), defaults to config value
+        
+    Returns:
+        True if cleanup is recommended
+    """
+    if threshold is None:
+        threshold = IMAGE_GENERATION_CONFIG["memory_cleanup_threshold"]
+    
+    memory_stats = check_gpu_memory()
+    if memory_stats["total"] == 0:
+        return False
+    
+    usage_ratio = memory_stats["allocated"] / memory_stats["total"]
+    return usage_ratio >= threshold
+
+
 # Additional image generation utilities
 class ImageGenerationHelper:
     """Helper class for image generation operations"""
@@ -110,7 +162,11 @@ class ImageGenerationHelper:
         cfg: float,
         width: int,
         height: int,
-        lora_info: Dict[str, Any] = None
+        lora_info: Dict[str, Any] = None,
+        use_fp8: bool = False,
+        use_vae_cache: bool = False,
+        sampling_mode: str = "dpm-solver++",
+        transformer_model: str = "base"
     ) -> Dict[str, Any]:
         """
         Prepare metadata for generated images
@@ -129,8 +185,11 @@ class ImageGenerationHelper:
             "cfg": cfg,
             "width": width,
             "height": height,
-            "model": "FramePack-I2V",
-            "mode": "image_generation"
+            "model": f"FramePack-HunyuanVideo ({transformer_model})",
+            "mode": "image_generation",
+            "sampling_mode": sampling_mode,
+            "use_fp8": use_fp8,
+            "use_vae_cache": use_vae_cache
         }
         
         if lora_info:
@@ -144,7 +203,9 @@ class ImageGenerationHelper:
         batch_size: int,
         width: int,
         height: int,
-        dtype: torch.dtype = torch.float16
+        dtype: torch.dtype = torch.float16,
+        use_fp8: bool = False,
+        use_vae_cache: bool = False
     ) -> Dict[str, float]:
         """
         Estimate memory requirements for image generation
@@ -154,6 +215,8 @@ class ImageGenerationHelper:
             width: Image width
             height: Image height
             dtype: Data type for tensors
+            use_fp8: Whether FP8 optimization is used
+            use_vae_cache: Whether VAE caching is used
             
         Returns:
             Dictionary with memory estimates in GB
@@ -165,18 +228,23 @@ class ImageGenerationHelper:
             latent_elements *= dim
             
         # Bytes per element
-        bytes_per_element = 2 if dtype == torch.float16 else 4
+        if use_fp8:
+            bytes_per_element = 1  # FP8
+        elif dtype == torch.float16:
+            bytes_per_element = 2
+        else:
+            bytes_per_element = 4
         
         # Estimate memory usage
         latent_memory = (latent_elements * bytes_per_element) / (1024**3)  # GB
         
         # Rough estimates for other components
         text_encoder_memory = 0.5  # GB
-        vae_memory = 1.0  # GB
-        transformer_memory = 8.0  # GB (for the base model)
+        vae_memory = 1.0 if not use_vae_cache else 0.5  # GB (reduced with caching)
+        transformer_memory = 8.0 if not use_fp8 else 4.0  # GB (reduced with FP8)
         
         # Working memory estimate (buffers, gradients if training, etc.)
-        working_memory = latent_memory * 4
+        working_memory = latent_memory * 3 if not use_vae_cache else latent_memory * 2
         
         return {
             "latent_memory": latent_memory,
@@ -189,3 +257,122 @@ class ImageGenerationHelper:
                 vae_memory + transformer_memory + working_memory
             )
         }
+    
+    @staticmethod
+    def optimize_batch_size(
+        width: int,
+        height: int,
+        available_memory_gb: float,
+        use_fp8: bool = False,
+        use_vae_cache: bool = False
+    ) -> int:
+        """
+        Calculate optimal batch size based on available memory
+        
+        Args:
+            width: Image width
+            height: Image height
+            available_memory_gb: Available GPU memory in GB
+            use_fp8: Whether FP8 optimization is used
+            use_vae_cache: Whether VAE caching is used
+            
+        Returns:
+            Recommended batch size
+        """
+        # Start with batch size 1 and increase until memory limit
+        for batch_size in range(1, IMAGE_GENERATION_CONFIG["max_batch_size"] + 1):
+            memory_req = ImageGenerationHelper.calculate_memory_requirements(
+                batch_size, width, height, 
+                dtype=torch.float16,
+                use_fp8=use_fp8,
+                use_vae_cache=use_vae_cache
+            )
+            
+            if memory_req["total_estimated"] > available_memory_gb * 0.9:  # 90% safety margin
+                return max(1, batch_size - 1)
+        
+        return IMAGE_GENERATION_CONFIG["max_batch_size"]
+
+
+class ImageGenerationOptimizer:
+    """Advanced optimization utilities for image generation"""
+    
+    @staticmethod
+    def get_optimal_settings(
+        width: int,
+        height: int,
+        high_vram: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Get optimal settings based on resolution and VRAM
+        
+        Args:
+            width: Target width
+            height: Target height
+            high_vram: Whether high VRAM mode is enabled
+            
+        Returns:
+            Dictionary of recommended settings
+        """
+        memory_stats = check_gpu_memory()
+        available_memory = memory_stats["free"]
+        
+        # Base recommendations
+        settings = {
+            "use_fp8": torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8,
+            "use_vae_cache": True,
+            "gpu_memory_preservation": 10.0 if high_vram else 6.0,
+            "text_encoding_cache": True,
+            "clear_memory_steps": 5 if not high_vram else 10,
+        }
+        
+        # Adjust batch size
+        if high_vram:
+            settings["batch_size"] = min(8, IMAGE_GENERATION_CONFIG["max_batch_size"])
+        else:
+            settings["batch_size"] = ImageGenerationHelper.optimize_batch_size(
+                width, height, available_memory,
+                use_fp8=settings["use_fp8"],
+                use_vae_cache=settings["use_vae_cache"]
+            )
+        
+        # Adjust based on resolution
+        pixels = width * height
+        if pixels > 1920 * 1080:  # Over 1080p
+            settings["use_vae_cache"] = True
+            settings["batch_size"] = min(settings["batch_size"], 2)
+            settings["gpu_memory_preservation"] = 8.0 if not high_vram else 12.0
+        
+        return settings
+    
+    @staticmethod
+    def prepare_lora_configs(
+        lora_paths: List[str],
+        lora_scales: List[float],
+        lora_dir: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Prepare LoRA configurations for batch loading
+        
+        Args:
+            lora_paths: List of LoRA paths
+            lora_scales: List of LoRA scales
+            lora_dir: Base directory for LoRAs
+            
+        Returns:
+            List of LoRA configuration dictionaries
+        """
+        import os
+        
+        configs = []
+        for i, lora_path in enumerate(lora_paths):
+            full_path = os.path.join(lora_dir, lora_path) if not os.path.isabs(lora_path) else lora_path
+            if os.path.exists(full_path):
+                scale = lora_scales[i] if i < len(lora_scales) else 1.0
+                configs.append({
+                    "path": full_path,
+                    "scale": scale,
+                    "name": os.path.basename(lora_path)
+                })
+        
+        return configs

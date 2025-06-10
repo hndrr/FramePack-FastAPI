@@ -201,6 +201,9 @@ def load_queue_from_file() -> list[QueuedJob]:
 # Load existing queue on startup into the global variable
 job_queue = load_queue_from_file()
 
+# Global storage for job data (for image generation jobs)
+job_data_storage: Dict[str, dict] = {}
+
 
 def save_image_to_temp(image: np.ndarray, job_id: str, prompt: str, seed: int, exif_data: Optional[bytes] = None) -> str:
     """Save image to temp directory as JPEG with Exif metadata and return the path"""
@@ -283,8 +286,11 @@ def add_to_queue(prompt, image, original_exif: Optional[bytes], video_length, se
 
 def add_job(job_id: str, job_data: Dict[str, Any]):
     """Add a generic job to the queue"""
-    global job_queue
+    global job_queue, job_data_storage
     try:
+        # Store job data for image generation jobs
+        job_data_storage[job_id] = job_data
+        
         job = QueuedJob(
             prompt=job_data.get("data", {}).get("prompt", ""),
             image_path="",  # Will be filled for video jobs
@@ -438,6 +444,12 @@ def get_next_job():
         logging.error(f"Error getting next job: {str(e)}")
         traceback.print_exc()
         return None
+
+
+def get_job_data_by_id(job_id: str) -> Optional[dict]:
+    """Get job data dictionary by job ID"""
+    global job_data_storage
+    return job_data_storage.get(job_id)
 
 
 def get_job_by_id(job_id: str) -> QueuedJob | None:
