@@ -126,6 +126,9 @@ async def lifespan(app: FastAPI):
 # Use the lifespan context manager
 app = FastAPI(title="FramePack API", version="0.1.0", lifespan=lifespan)
 
+# Set maximum file size (100MB)
+app.state.max_request_size = 100 * 1024 * 1024
+
 # --- CORS Middleware Configuration ---
 app.add_middleware(
     CORSMiddleware,
@@ -232,6 +235,8 @@ class ImageGenerationResponse(BaseModel):
     message: str
 
 
+
+
 # --- Enum for Sampling Mode ---
 class SamplingMode(str, enum.Enum):
     reverse = "reverse"
@@ -261,7 +266,23 @@ def background_worker_task():
                     currently_processing_job_id = None
                     continue
 
-                worker.worker(next_job, loaded_models)
+                # Check job type and route to appropriate worker
+                job_data = queue_manager.get_job_data_by_id(currently_processing_job_id)
+                if job_data and isinstance(job_data, dict):
+                    job_type = job_data.get("type", "video")
+                    
+                    if job_type == "image_generation":
+                        worker_image.process_image_generation(currently_processing_job_id, job_data, loaded_models)
+                    elif job_type == "batch_images":
+                        worker_image.process_batch_images(currently_processing_job_id, job_data, loaded_models)
+                    elif job_type == "image_transfer":
+                        worker_image.process_image_transfer(currently_processing_job_id, job_data, loaded_models)
+                    else:
+                        # Default to video generation
+                        worker.worker(next_job, loaded_models)
+                else:
+                    # Fallback to video generation for compatibility
+                    worker.worker(next_job, loaded_models)
             except Exception as e:
                 print(f"Unhandled exception in worker for job {currently_processing_job_id}: {e}")
                 traceback.print_exc()
@@ -781,7 +802,7 @@ async def generate_image(
     gpu_memory_preservation: float = Form(10.0, description="GPU memory to preserve (GB) in low VRAM mode."),
     sampling_mode: str = Form("dpm-solver++", description="Sampling mode."),
     transformer_model: str = Form("base", description="Transformer model (base or f1)."),
-    input_image: UploadFile = File(..., description="Input image file (required).")
+    input_image: UploadFile = File(..., description="Input image file (required).", media_type="image/*")
 ):
     """
     Generate a single high-quality image from input image and text prompt (Image-to-Image).
@@ -791,21 +812,50 @@ async def generate_image(
     
     # Read and encode input image
     try:
-        contents = await input_image.read()
-        import base64
-        input_image_b64 = base64.b64encode(contents).decode('utf-8')
+        print(f"Debug: input_image type = {type(input_image)}")
+        
+        # Handle different types of input_image
+        if isinstance(input_image, str):
+            # If it's already a string, assume it's base64 encoded
+            print("Debug: input_image is a string, treating as base64")
+            input_image_b64 = input_image
+        elif hasattr(input_image, 'read'):
+            # It's an UploadFile
+            print(f"Debug: input_image is UploadFile")
+            if hasattr(input_image, 'filename'):
+                print(f"Debug: filename = {input_image.filename}")
+            if hasattr(input_image, 'content_type'):
+                print(f"Debug: content_type = {input_image.content_type}")
+            
+            contents = await input_image.read()
+            print(f"Debug: Read {len(contents)} bytes from UploadFile")
+            
+            import base64
+            input_image_b64 = base64.b64encode(contents).decode('utf-8')
+            print(f"Debug: Encoded to base64, length = {len(input_image_b64)}")
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid input_image type: {type(input_image)}. Expected UploadFile or base64 string.")
+        
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read input image: {e}")
+        print(f"Debug: Exception occurred: {e}")
+        print(f"Debug: Exception type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=f"Error loading image: {e}")
     finally:
-        await input_image.close()
+        if hasattr(input_image, 'close'):
+            try:
+                await input_image.close()
+            except:
+                pass
     
-    # Create a unique job ID
+    # Create a unique job ID (8-digit hex like video generation)
     import uuid
-    job_id = str(uuid.uuid4())
+    job_id = uuid.uuid4().hex[:8]
     
     # Prepare job data
     job_data = {
-        "type": "image",
+        "type": "image_generation",
         "data": {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
@@ -832,17 +882,13 @@ async def generate_image(
         print(f"Error adding image job to queue: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
     
-    # Start processing in background
-    threading.Thread(
-        target=worker_image.process_image_generation,
-        args=(job_id, job_data, loaded_models),
-        daemon=True
-    ).start()
+    # Jobs will be processed by the background worker
     
     return ImageGenerationResponse(
         job_id=job_id,
         message="Image generation job added to queue."
     )
+
 
 
 @app.post("/api/batch-images", response_model=ImageGenerationResponse)
@@ -853,9 +899,9 @@ async def batch_images(request: BatchImageRequest):
     if not loaded_models:
         raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
     
-    # Create a unique job ID
+    # Create a unique job ID (8-digit hex like video generation)
     import uuid
-    job_id = str(uuid.uuid4())
+    job_id = uuid.uuid4().hex[:8]
     
     # Prepare job data
     job_data = {
@@ -872,12 +918,7 @@ async def batch_images(request: BatchImageRequest):
         print(f"Error adding batch image job to queue: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
     
-    # Start processing in background
-    threading.Thread(
-        target=worker_image.process_batch_images,
-        args=(job_id, job_data, loaded_models),
-        daemon=True
-    ).start()
+    # Jobs will be processed by the background worker
     
     return ImageGenerationResponse(
         job_id=job_id,
@@ -893,9 +934,9 @@ async def transfer_image(request: ImageTransferRequest):
     if not loaded_models:
         raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
     
-    # Create a unique job ID
+    # Create a unique job ID (8-digit hex like video generation)
     import uuid
-    job_id = str(uuid.uuid4())
+    job_id = uuid.uuid4().hex[:8]
     
     # Prepare job data
     job_data = {
@@ -912,12 +953,7 @@ async def transfer_image(request: ImageTransferRequest):
         print(f"Error adding image transfer job to queue: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
     
-    # Start processing in background
-    threading.Thread(
-        target=worker_image.process_image_transfer,
-        args=(job_id, job_data, loaded_models),
-        daemon=True
-    ).start()
+    # Jobs will be processed by the background worker
     
     return ImageGenerationResponse(
         job_id=job_id,
