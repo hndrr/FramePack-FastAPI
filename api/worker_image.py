@@ -241,20 +241,10 @@ def process_image_generation(job_id: str, job_data: dict, models: dict):
             llama_vec_n, length=512
         )
 
-        # Apply FP8 optimization to transformer if requested
-        if use_fp8 and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
-            qm.update_job_progress(job_id, 0.12, 12, 100, "Applying FP8 optimization...")
-            transformer = apply_fp8_optimization_simple(transformer)
-
-        # Load LoRA if specified
-        if lora_path:
-            full_lora_path = os.path.join(settings.LORA_DIR, lora_path) if not os.path.isabs(lora_path) else lora_path
-            if os.path.exists(full_lora_path):
-                qm.update_job_progress(job_id, 0.15, 15, 100, f"Loading LoRA: {lora_path}")
-                lora_dir, lora_name = os.path.split(full_lora_path)
-                transformer = load_lora(transformer, Path(lora_dir), lora_name, lora_scale=lora_scale)
-                # Ensure LoRA parameters are on GPU
-                transformer = transformer.to(gpu)
+        # FP8 optimization is disabled for stability
+        # if use_fp8 and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        #     qm.update_job_progress(job_id, 0.12, 12, 100, "Applying FP8 optimization...")
+        #     transformer = apply_fp8_optimization_simple(transformer)
 
         # Encode input image with CLIP vision
         qm.update_job_progress(job_id, 0.18, 18, 100, "Encoding input image...")
@@ -297,17 +287,32 @@ def process_image_generation(job_id: str, job_data: dict, models: dict):
         llama_attention_mask = llama_attention_mask.to(gpu)
         llama_attention_mask_n = llama_attention_mask_n.to(gpu)
 
+        # Load LoRA if specified (following video generation pattern)
+        if lora_path:
+            full_lora_path = os.path.join(settings.LORA_DIR, lora_path) if not os.path.isabs(lora_path) else lora_path
+            if os.path.exists(full_lora_path):
+                qm.update_job_progress(job_id, 0.27, 27, 100, f"Loading LoRA: {lora_path}")
+                lora_dir, lora_name = os.path.split(full_lora_path)
+                try:
+                    transformer = load_lora(transformer, Path(lora_dir), lora_name, lora_scale=lora_scale)
+                    print(f"Job {job_id}: LoRA loaded successfully from {full_lora_path}")
+                except Exception as e:
+                    print(f"Job {job_id}: Error loading LoRA: {e}")
+                    # Continue without LoRA instead of failing
+            else:
+                print(f"Job {job_id}: LoRA file not found at {full_lora_path}")
+
         # Move transformer to GPU with memory preservation
         if not high_vram:
             unload_complete_models()  # Unload other models first
-            if not next(transformer.parameters()).is_cuda:
-                move_model_to_device_with_memory_preservation(
-                    transformer,
-                    target_device=gpu,
-                    preserved_memory_gb=gpu_memory_preservation
-                )
-            else:
-                print(f"Job {job_id}: Transformer already on GPU")
+            move_model_to_device_with_memory_preservation(
+                transformer,
+                target_device=gpu,
+                preserved_memory_gb=gpu_memory_preservation
+            )
+        else:
+            # In high VRAM mode, simply move to GPU
+            transformer = transformer.to(gpu)
 
         # Generate using sample_hunyuan
         qm.update_job_progress(job_id, 0.3, 30, 100, "Generating image...")
