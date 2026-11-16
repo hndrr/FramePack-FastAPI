@@ -1,0 +1,51 @@
+# Git files
+.git/
+.gitignore
+
+# Python virtual environment
+venv/
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+.eggs/
+*.egg-info/
+dist/
+build/
+wheels/
+*.tar.gz
+*.whl
+
+# Test files
+tests/
+
+# Temporary files
+temp_queue_images/
+*.tmp
+*.bak
+*.swp
+
+# Documentation / Planning files
+*.md
+LICENSE
+
+# Archives
+*.7z
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor specific files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
