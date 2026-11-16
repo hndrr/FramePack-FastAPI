@@ -188,3 +188,5 @@ job_queue.json
 main.obj
 main.exp
 main.lib
+CLAUDE.md
+.mcp/

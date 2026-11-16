@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  framepack-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - HF_HOME=/app/hf_download
+      - TRANSFORMERS_CACHE=/app/hf_download
+      - HF_DATASETS_CACHE=/app/hf_download
+    volumes:
+      # Application data
+      - ./outputs:/app/outputs
+      - ./temp_queue_images:/app/temp_queue_images
+      - ./loras:/app/loras
+      - ./job_queue.json:/app/job_queue.json
+      # External model mount point
+      - ./hf_download:/app/hf_download
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    labels:
+      - "com.framepack.service=api"
+      - "com.framepack.description=FramePack API with external model mount"

@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 from PIL import Image
 import numpy as np
 from typing import List, Optional
+from datetime import datetime
+import uuid
 from watchdog.observers import Observer
 
 # Import modules created earlier (relative imports)
@@ -25,6 +27,7 @@ from . import models
 from . import queue_manager
 from . import worker
 from . import video_watcher
+from . import worker_image
 
 # --- Global State ---
 # Dictionary to hold loaded models
@@ -45,17 +48,21 @@ async def lifespan(app: FastAPI):
     # Startup logic
     global loaded_models, worker_running, worker_thread, observer, sse_clients
     print("API starting up via lifespan...")
-    # Load models
-    try:
-        # Consider running blocking IO in a threadpool executor in async context
-        # e.g., await asyncio.to_thread(models.load_models)
-        # For simplicity now, keeping the direct call but be aware of potential blocking
-        loaded_models = models.load_models()
-        print("Models loaded successfully via lifespan.")
-    except Exception as e:
-        print(f"FATAL: Failed to load models on startup via lifespan: {e}")
-        traceback.print_exc()
+    # Load models (skip if in development mode)
+    if os.getenv("MODELS_DISABLED", "false").lower() == "true":
+        print("Models loading disabled - running in development mode")
         loaded_models = {}
+    else:
+        try:
+            # Consider running blocking IO in a threadpool executor in async context
+            # e.g., await asyncio.to_thread(models.load_models)
+            # For simplicity now, keeping the direct call but be aware of potential blocking
+            loaded_models = models.load_models()
+            print("Models loaded successfully via lifespan.")
+        except Exception as e:
+            print(f"FATAL: Failed to load models on startup via lifespan: {e}")
+            traceback.print_exc()
+            loaded_models = {}
 
     # Start background worker
     if not worker_running:
@@ -119,6 +126,9 @@ async def lifespan(app: FastAPI):
 # Use the lifespan context manager
 app = FastAPI(title="FramePack API", version="0.1.0", lifespan=lifespan)
 
+# Set maximum file size (100MB)
+app.state.max_request_size = 100 * 1024 * 1024
+
 # --- CORS Middleware Configuration ---
 app.add_middleware(
     CORSMiddleware,
@@ -137,7 +147,7 @@ class GenerateRequest(BaseModel):
     video_length: float = Field(5.0, description="Length of the video in seconds.", gt=0)
     seed: int = Field(-1, description="Seed for generation. -1 for random.")
     use_teacache: bool = Field(False, description="Enable TEACache optimization.")
-    gpu_memory_preservation: float = Field(0.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
+    gpu_memory_preservation: float = Field(10.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
     steps: int = Field(20, description="Number of diffusion steps.", gt=0)
     cfg: float = Field(7.0, description="Classifier-Free Guidance scale.", ge=1.0)
     gs: float = Field(1.0, description="Guidance scale for start latent.", ge=0)
@@ -178,10 +188,65 @@ class ResultResponse(BaseModel):
     thumbnail_base64: Optional[str] = None
 
 
+# --- Image Generation Models ---
+class ImageGenerationRequest(BaseModel):
+    prompt: str = Field(..., description="Text prompt for image generation.")
+    negative_prompt: Optional[str] = Field("", description="Negative prompt.")
+    input_image: str = Field(..., description="Base64 encoded input image (required).")
+    seed: Optional[int] = Field(-1, description="Seed for generation. -1 for random.")
+    steps: int = Field(30, description="Number of diffusion steps.", gt=0)
+    cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
+    width: int = Field(1216, description="Image width.", gt=0)
+    height: int = Field(704, description="Image height.", gt=0)
+    gpu_memory_preservation: float = Field(10.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
+    lora_paths: Optional[List[str]] = Field(None, description="List of LoRA file paths.")
+    lora_scales: Optional[List[float]] = Field(None, description="List of LoRA scales.")
+
+
+class BatchImageRequest(BaseModel):
+    prompts: List[str] = Field(..., description="List of text prompts for batch generation.")
+    input_image: str = Field(..., description="Base64 encoded input image (used for all batch items).")
+    negative_prompt: Optional[str] = Field("", description="Negative prompt for all images.")
+    seeds: Optional[List[int]] = Field(None, description="List of seeds (one per prompt).")
+    batch_size: int = Field(4, description="Number of images to generate in parallel.", gt=0, le=8)
+    steps: int = Field(30, description="Number of diffusion steps.", gt=0)
+    cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
+    width: int = Field(1216, description="Image width.", gt=0)
+    height: int = Field(704, description="Image height.", gt=0)
+    gpu_memory_preservation: float = Field(10.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
+    lora_paths: Optional[List[str]] = Field(None, description="List of LoRA file paths.")
+    lora_scales: Optional[List[float]] = Field(None, description="List of LoRA scales.")
+
+
+class ImageTransferRequest(BaseModel):
+    source_image: str = Field(..., description="Base64 encoded source image.")
+    target_image: str = Field(..., description="Base64 encoded target image.")
+    prompt: str = Field(..., description="Text prompt for the transfer.")
+    negative_prompt: Optional[str] = Field("", description="Negative prompt.")
+    transfer_strength: float = Field(0.7, description="Strength of the style transfer.", ge=0.0, le=1.0)
+    seed: Optional[int] = Field(-1, description="Seed for generation. -1 for random.")
+    steps: int = Field(30, description="Number of diffusion steps.", gt=0)
+    cfg: float = Field(1.0, description="Classifier-Free Guidance scale.", ge=0.0)
+    gpu_memory_preservation: float = Field(10.0, description="GPU memory to preserve (GB) in low VRAM mode.", ge=0)
+
+
+class ImageGenerationResponse(BaseModel):
+    job_id: str
+    message: str
+
+
+
+
 # --- Enum for Sampling Mode ---
 class SamplingMode(str, enum.Enum):
     reverse = "reverse"
     forward = "forward"
+
+
+# --- Enum for Output Type ---
+class OutputType(str, enum.Enum):
+    video = "video"
+    image = "image"
 
 
 # --- Background Worker ---
@@ -201,7 +266,23 @@ def background_worker_task():
                     currently_processing_job_id = None
                     continue
 
-                worker.worker(next_job, loaded_models)
+                # Check job type and route to appropriate worker
+                job_data = queue_manager.get_job_data_by_id(currently_processing_job_id)
+                if job_data and isinstance(job_data, dict):
+                    job_type = job_data.get("type", "video")
+                    
+                    if job_type == "image_generation":
+                        worker_image.process_image_generation(currently_processing_job_id, job_data, loaded_models)
+                    elif job_type == "batch_images":
+                        worker_image.process_batch_images(currently_processing_job_id, job_data, loaded_models)
+                    elif job_type == "image_transfer":
+                        worker_image.process_image_transfer(currently_processing_job_id, job_data, loaded_models)
+                    else:
+                        # Default to video generation
+                        worker.worker(next_job, loaded_models)
+                else:
+                    # Fallback to video generation for compatibility
+                    worker.worker(next_job, loaded_models)
             except Exception as e:
                 print(f"Unhandled exception in worker for job {currently_processing_job_id}: {e}")
                 traceback.print_exc()
@@ -224,7 +305,7 @@ def background_worker_task():
 # === Job Execution Flow ===
 
 
-@app.post("/generate", response_model=GenerateResponse)
+@app.post("/generate", response_model=GenerateResponse, tags=["Video Generation"])
 async def generate_video(
     background_tasks: BackgroundTasks,
     prompt: str = Form("A character doing some simple body movements."),
@@ -311,8 +392,364 @@ async def generate_video(
     print(f"Job added to queue with ID: {job_id}")
     return GenerateResponse(job_id=job_id, message="Video generation job added to queue.")
 
+# --- Image Generation Endpoints ---
 
-@app.get("/status/{job_id}", response_model=JobStatusResponse)
+@app.post("/api/generate-image", response_model=ImageGenerationResponse, tags=["Image Generation"])
+async def generate_image(
+    prompt: str = Form(..., description="Text prompt for image generation."),
+    negative_prompt: str = Form("", description="Negative prompt."),
+    seed: int = Form(-1, description="Seed for generation. -1 for random."),
+    steps: int = Form(30, description="Number of diffusion steps."),
+    cfg: float = Form(1.0, description="Classifier-Free Guidance scale."),
+    width: int = Form(1216, description="Image width."),
+    height: int = Form(704, description="Image height."),
+    lora_path: Optional[str] = Form("", description="LoRA file path."),
+    lora_scale: float = Form(1.0, description="LoRA scale."),
+    gpu_memory_preservation: float = Form(10.0, description="GPU memory to preserve (GB) in low VRAM mode."),
+    sampling_mode: str = Form("dpm-solver++", description="Sampling mode."),
+    transformer_model: str = Form("base", description="Transformer model (base or f1)."),
+    input_image: UploadFile = File(..., description="Input image file (required).", media_type="image/*")
+):
+    """
+    Generate a single high-quality image from input image and text prompt (Image-to-Image).
+    """
+    if not loaded_models:
+        raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
+    
+    # Read and encode input image
+    try:
+        print(f"Debug: input_image type = {type(input_image)}")
+        
+        # Handle different types of input_image
+        if isinstance(input_image, str):
+            # If it's already a string, assume it's base64 encoded
+            print("Debug: input_image is a string, treating as base64")
+            input_image_b64 = input_image
+        elif hasattr(input_image, 'read'):
+            # It's an UploadFile
+            print(f"Debug: input_image is UploadFile")
+            if hasattr(input_image, 'filename'):
+                print(f"Debug: filename = {input_image.filename}")
+            if hasattr(input_image, 'content_type'):
+                print(f"Debug: content_type = {input_image.content_type}")
+            
+            contents = await input_image.read()
+            print(f"Debug: Read {len(contents)} bytes from UploadFile")
+            
+            import base64
+            input_image_b64 = base64.b64encode(contents).decode('utf-8')
+            print(f"Debug: Encoded to base64, length = {len(input_image_b64)}")
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid input_image type: {type(input_image)}. Expected UploadFile or base64 string.")
+        
+    except Exception as e:
+        print(f"Debug: Exception occurred: {e}")
+        print(f"Debug: Exception type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=f"Error loading image: {e}")
+    finally:
+        if hasattr(input_image, 'close'):
+            try:
+                await input_image.close()
+            except:
+                pass
+    
+    # Create a unique job ID (8-digit hex like video generation)
+    import uuid
+    job_id = uuid.uuid4().hex[:8]
+    
+    # Prepare job data
+    job_data = {
+        "type": "image_generation",
+        "data": {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "input_image": input_image_b64,
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "width": width,
+            "height": height,
+            "lora_path": lora_path,
+            "lora_scale": lora_scale,
+            "gpu_memory_preservation": gpu_memory_preservation,
+            "sampling_mode": sampling_mode,
+            "transformer_model": transformer_model
+        },
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Add to queue
+    try:
+        queue_manager.add_job(job_id, job_data)
+        print(f"Image generation job added to queue: {job_id}")
+    except Exception as e:
+        print(f"Error adding image job to queue: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
+    
+    # Jobs will be processed by the background worker
+    
+    return ImageGenerationResponse(
+        job_id=job_id,
+        message="Image generation job added to queue."
+    )
+
+
+
+@app.post("/api/batch-images", response_model=ImageGenerationResponse, tags=["Image Generation"])
+async def batch_images(
+    prompts: str = Form(..., description="Comma-separated list of text prompts for batch generation."),
+    negative_prompt: str = Form("", description="Negative prompt for all images."),
+    seeds: str = Form("", description="Comma-separated list of seeds (optional, one per prompt)."),
+    steps: int = Form(30, description="Number of diffusion steps."),
+    cfg: float = Form(1.0, description="Classifier-Free Guidance scale."),
+    width: int = Form(1216, description="Image width."),
+    height: int = Form(704, description="Image height."),
+    lora_path: str = Form("", description="LoRA file path."),
+    lora_scale: float = Form(1.0, description="LoRA scale."),
+    gpu_memory_preservation: float = Form(10.0, description="GPU memory to preserve (GB) in low VRAM mode."),
+    sampling_mode: str = Form("dpm-solver++", description="Sampling mode."),
+    transformer_model: str = Form("base", description="Transformer model (base or f1)."),
+    input_image: UploadFile = File(..., description="Input image file (used for all batch items).", media_type="image/*")
+):
+    """
+    Generate multiple images in batch from a list of prompts.
+    """
+    if not loaded_models:
+        raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
+    
+    # Read and encode input image
+    try:
+        print(f"Debug: input_image type = {type(input_image)}")
+        
+        if isinstance(input_image, str):
+            input_image_b64 = input_image
+        elif hasattr(input_image, 'read'):
+            print(f"Debug: input_image is UploadFile")
+            if hasattr(input_image, 'filename'):
+                print(f"Debug: filename = {input_image.filename}")
+            
+            contents = await input_image.read()
+            print(f"Debug: Read {len(contents)} bytes from UploadFile")
+            
+            import base64
+            input_image_b64 = base64.b64encode(contents).decode('utf-8')
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid input_image type: {type(input_image)}")
+        
+    except Exception as e:
+        print(f"Debug: Input image error: {e}")
+        raise HTTPException(status_code=400, detail=f"Error loading input image: {e}")
+    finally:
+        if hasattr(input_image, 'close'):
+            try:
+                await input_image.close()
+            except:
+                pass
+    
+    # Parse prompts (comma-separated)
+    prompts_list = [p.strip() for p in prompts.split(',') if p.strip()]
+    if not prompts_list:
+        raise HTTPException(status_code=400, detail="At least one prompt is required.")
+    
+    # Parse seeds (comma-separated, optional)
+    seeds_list = []
+    if seeds.strip():
+        try:
+            seeds_list = [int(s.strip()) for s in seeds.split(',') if s.strip()]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Seeds must be integers separated by commas.")
+    
+    # If no seeds provided, generate random ones
+    if not seeds_list:
+        import random
+        seeds_list = [random.randint(0, 2**32 - 1) for _ in prompts_list]
+    
+    # Ensure seeds list matches prompts list length
+    while len(seeds_list) < len(prompts_list):
+        import random
+        seeds_list.append(random.randint(0, 2**32 - 1))
+    
+    print(f"Debug: Processing {len(prompts_list)} prompts with {len(seeds_list)} seeds")
+    
+    # Create a unique job ID (8-digit hex like video generation)
+    import uuid
+    job_id = uuid.uuid4().hex[:8]
+    
+    # Prepare job data
+    job_data = {
+        "type": "batch_images",
+        "data": {
+            "prompts": prompts_list,
+            "input_image": input_image_b64,
+            "negative_prompt": negative_prompt,
+            "seeds": seeds_list,
+            "steps": steps,
+            "cfg": cfg,
+            "width": width,
+            "height": height,
+            "lora_path": lora_path,
+            "lora_scale": lora_scale,
+            "gpu_memory_preservation": gpu_memory_preservation,
+            "sampling_mode": sampling_mode,
+            "transformer_model": transformer_model
+        },
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Add to queue
+    try:
+        queue_manager.add_job(job_id, job_data)
+        print(f"Batch image generation job added to queue: {job_id}")
+    except Exception as e:
+        print(f"Error adding batch image job to queue: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
+    
+    # Jobs will be processed by the background worker
+    
+    return ImageGenerationResponse(
+        job_id=job_id,
+        message="Batch image generation job added to queue."
+    )
+
+
+@app.post("/api/transfer-image", response_model=ImageGenerationResponse, tags=["Image Generation"])
+async def transfer_image(
+    prompt: str = Form(..., description="Text prompt for the transfer."),
+    negative_prompt: str = Form("", description="Negative prompt."),
+    transfer_strength: float = Form(0.7, description="Strength of the style transfer."),
+    seed: int = Form(-1, description="Seed for generation. -1 for random."),
+    steps: int = Form(30, description="Number of diffusion steps."),
+    cfg: float = Form(1.0, description="Classifier-Free Guidance scale."),
+    gpu_memory_preservation: float = Form(10.0, description="GPU memory to preserve (GB) in low VRAM mode."),
+    sampling_mode: str = Form("dpm-solver++", description="Sampling mode."),
+    transformer_model: str = Form("base", description="Transformer model (base or f1)."),
+    source_image: UploadFile = File(..., description="Source image file for style reference.", media_type="image/*"),
+    target_image: UploadFile = File(..., description="Target image file to apply style to.", media_type="image/*")
+):
+    """
+    Transfer style from source image to target image (kisekaeichi functionality).
+    """
+    if not loaded_models:
+        raise HTTPException(status_code=503, detail="Models are not loaded or failed to load. API is not ready.")
+    
+    # Read and encode source image
+    try:
+        print(f"Debug: source_image type = {type(source_image)}")
+        
+        if isinstance(source_image, str):
+            source_image_b64 = source_image
+        elif hasattr(source_image, 'read'):
+            print(f"Debug: source_image is UploadFile")
+            if hasattr(source_image, 'filename'):
+                print(f"Debug: source filename = {source_image.filename}")
+            
+            contents = await source_image.read()
+            print(f"Debug: Read {len(contents)} bytes from source UploadFile")
+            
+            import base64
+            source_image_b64 = base64.b64encode(contents).decode('utf-8')
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid source_image type: {type(source_image)}")
+        
+    except Exception as e:
+        print(f"Debug: Source image error: {e}")
+        raise HTTPException(status_code=400, detail=f"Error loading source image: {e}")
+    finally:
+        if hasattr(source_image, 'close'):
+            try:
+                await source_image.close()
+            except:
+                pass
+
+    # Read and encode target image
+    try:
+        print(f"Debug: target_image type = {type(target_image)}")
+        
+        if isinstance(target_image, str):
+            target_image_b64 = target_image
+        elif hasattr(target_image, 'read'):
+            print(f"Debug: target_image is UploadFile")
+            if hasattr(target_image, 'filename'):
+                print(f"Debug: target filename = {target_image.filename}")
+            
+            contents = await target_image.read()
+            print(f"Debug: Read {len(contents)} bytes from target UploadFile")
+            
+            import base64
+            target_image_b64 = base64.b64encode(contents).decode('utf-8')
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid target_image type: {type(target_image)}")
+        
+    except Exception as e:
+        print(f"Debug: Target image error: {e}")
+        raise HTTPException(status_code=400, detail=f"Error loading target image: {e}")
+    finally:
+        if hasattr(target_image, 'close'):
+            try:
+                await target_image.close()
+            except:
+                pass
+    
+    # Create a unique job ID (8-digit hex like video generation)
+    import uuid
+    job_id = uuid.uuid4().hex[:8]
+    
+    # Prepare job data
+    job_data = {
+        "type": "image_transfer",
+        "data": {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+            "source_image": source_image_b64,
+            "target_image": target_image_b64,
+            "transfer_strength": transfer_strength,
+            "seed": seed,
+            "steps": steps,
+            "cfg": cfg,
+            "gpu_memory_preservation": gpu_memory_preservation,
+            "sampling_mode": sampling_mode,
+            "transformer_model": transformer_model
+        },
+        "created_at": datetime.now().isoformat()
+    }
+    
+    # Add to queue
+    try:
+        queue_manager.add_job(job_id, job_data)
+        print(f"Image transfer job added to queue: {job_id}")
+    except Exception as e:
+        print(f"Error adding image transfer job to queue: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add job to queue: {e}")
+    
+    # Jobs will be processed by the background worker
+    
+    return ImageGenerationResponse(
+        job_id=job_id,
+        message="Image transfer job added to queue."
+    )
+
+
+@app.get("/api/image/{job_id}", tags=["Image Generation"])
+async def get_generated_image(job_id: str):
+    """
+    Download the generated image file.
+    """
+    # Check job status first
+    job = queue_manager.get_job_by_id(job_id)
+    if job and job.status != "completed":
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' is not completed yet (status: {job.status}).")
+    
+    # Check for image file
+    image_path = os.path.join("outputs/images", f"{job_id}.png")
+    if os.path.exists(image_path):
+        return FileResponse(image_path, media_type="image/png", filename=f"{job_id}.png")
+    else:
+        raise HTTPException(status_code=404, detail=f"Image file for job '{job_id}' not found.")
+
+
+@app.get("/status/{job_id}", response_model=JobStatusResponse, tags=["Job Management"])
 async def get_job_status(job_id: str):
     """Checks the status of a job."""
     global currently_processing_job_id
@@ -362,7 +799,7 @@ async def get_job_status(job_id: str):
     raise HTTPException(status_code=404, detail="Job not found")
 
 
-@app.get("/stream/status/{job_id}")
+@app.get("/stream/status/{job_id}", tags=["Job Management"])
 async def stream_job_status(job_id: str, request: Request):
     """
     Streams the status and progress of a job using Server-Sent Events (SSE).
@@ -434,7 +871,7 @@ async def stream_job_status(job_id: str, request: Request):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@app.get("/result/{job_id}", response_model=ResultResponse)
+@app.get("/result/{job_id}", response_model=ResultResponse, tags=["Video Generation"])
 async def get_job_result(job_id: str, request: Request):
     """
     Returns the download URL for the completed video and the Base64 encoded thumbnail.
@@ -480,7 +917,7 @@ async def get_job_result(job_id: str, request: Request):
 
 # --- Download Endpoints ---
 
-@app.get("/download/video/{job_id}")
+@app.get("/download/video/{job_id}", tags=["Video Generation"])
 async def download_video(job_id: str):
     """Downloads the generated video file."""
     output_file = os.path.join(settings.OUTPUTS_DIR, f"{job_id}.mp4")
@@ -495,7 +932,7 @@ async def download_video(job_id: str):
             raise HTTPException(status_code=404, detail=f"Video file for job '{job_id}' not found.")
 
 
-@app.get("/input_image/{job_id}")
+@app.get("/input_image/{job_id}", tags=["Job Management"])
 async def get_input_image(job_id: str):
     """
     Returns the input JPEG image file associated with a job, potentially including Exif metadata.
@@ -527,7 +964,7 @@ async def get_input_image(job_id: str):
     return FileResponse(input_image_path_from_job, media_type="image/jpeg", filename=f"input_{job_id}.jpg")
 
 
-@app.post("/cancel/{job_id}", status_code=200)
+@app.post("/cancel/{job_id}", status_code=200, tags=["Job Management"])
 async def cancel_job(job_id: str):
     """Requests cancellation of a job."""
     # Check if the job exists (optional but good practice)
@@ -566,14 +1003,14 @@ async def cancel_job(job_id: str):
 
 # === Queue & Worker Management ===
 
-@app.get("/queue", response_model=QueueStatusResponse)
+@app.get("/queue", response_model=QueueStatusResponse, tags=["Job Management"])
 async def get_queue_info():
     # Implementation needed: Get queue status from queue_manager
     queue_status = queue_manager.get_queue_status()
     return QueueStatusResponse(queue=queue_status)
 
 
-@app.get("/worker/status", response_model=WorkerStatusResponse)
+@app.get("/worker/status", response_model=WorkerStatusResponse, tags=["Job Management"])
 async def get_worker_status():
     """Returns the current status of the background worker."""
     global worker_running, currently_processing_job_id
@@ -583,7 +1020,7 @@ async def get_worker_status():
     )
 
 
-@app.post("/cleanup_jobs", status_code=200)
+@app.post("/cleanup_jobs", status_code=200, tags=["Job Management"])
 async def trigger_cleanup_jobs():
     """
     Manually triggers the cleanup of old completed, cancelled, or failed jobs
@@ -600,7 +1037,7 @@ async def trigger_cleanup_jobs():
 
 # === Settings & Information ===
 
-@app.get("/loras", response_model=LoraListResponse)
+@app.get("/loras", response_model=LoraListResponse, tags=["Settings"])
 async def list_loras():
     """Lists available LoRA files from the configured directory."""
     lora_files = []
@@ -624,7 +1061,7 @@ async def list_loras():
 
 # === Video Streaming Endpoints ===
 
-@app.get("/video_stream")
+@app.get("/video_stream", tags=["Video Streaming"])
 async def video_stream(request: Request):
     """
     Streams new video filenames using Server-Sent Events (SSE).
@@ -664,7 +1101,7 @@ async def video_stream(request: Request):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@app.get("/videos/{filename}")
+@app.get("/videos/{filename}", tags=["Video Streaming"])
 async def get_video(filename: str):
     """
     Serves a specific video file from the VIDEO_DIR.
@@ -687,7 +1124,7 @@ async def get_video(filename: str):
     return FileResponse(filepath, media_type="video/mp4", filename=filename)
 
 
-@app.get("/videos", response_model=List[str])
+@app.get("/videos", response_model=List[str], tags=["Video Streaming"])
 async def list_videos():
     """
     Lists all .mp4 files currently in the VIDEO_DIR.
@@ -703,7 +1140,6 @@ async def list_videos():
     except Exception as e:
         logging.error(f"Error listing videos in {settings.VIDEO_DIR}: {e}")
         raise HTTPException(status_code=500, detail="Error listing video files.")
-
 
 # --- Main execution (for running with uvicorn) ---
 if __name__ == "__main__":
